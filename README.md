@@ -1,3 +1,6 @@
 This is the firmware source code of the LLL buffer. 
-Two places need to modify TMCStepper before build, otherwise the compiled properly drive motor, modify, please refer to the following link
-[Fly3DTeam/TMCStepper](https://github.com/MarlinFirmware/TMCStepper/compare/master...Fly3DTeam:TMCStepper:master)
+Please open the project with VS Code and install the PlatformIO IDE extension.
+Plugin Installation Steps:
+1. Open VS Code.
+2. Click on the Extensions icon on the left sidebar.
+3. Search for "PlatformIO IDE" in the search bar.
