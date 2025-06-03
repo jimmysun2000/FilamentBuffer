@@ -1,29 +1,3 @@
-/**
-  ***************************************************************************************
-  * @file    buffer.cpp
-  * @author  lijihu
-  * @version V1.0.0
-  * @date    2025/05/10
-  * @brief   实现缓冲器功能
-			  *缓冲器说明
-				光感：遮挡1，不遮挡0；
-				耗材开关：有耗材0，无耗材1；
-				按键：按下0，松开1；
-
-				引脚：
-				HALL1 --> PB2 (光感3)
-				HALL2 --> PB3 (光感2)
-				HALL3 --> PB4 (光感1)
-				ENDSTOP_3 --> PB7(耗材开关)
-				KEY1 --> PB13(后退)	
-				KEY2 --> PB12(前进)
-  *
-  * @note    
-  ***************************************************************************************
-  * 版权声明 COPYRIGHT 2024 xxx@126.com
-  ***************************************************************************************
-**/
-
 #ifndef __BUFFER_H__
 #define __BUFFER_H__
 
@@ -31,59 +5,58 @@
 #include <Arduino.h>
 #include <EEPROM.h>
 
-#define HALL1       PB2 //光感3
-#define HALL2       PB3 //光感2   
-#define HALL3       PB4 //光感1
+#define HALL1       		PB2 		// Hall Sensor 3
+#define HALL2       		PB3 		// Hall Sensor 2   
+#define HALL3       		PB4 		// Hall Sensor 1
 
-#define ENDSTOP_3   PB7 //耗材开关
+#define ENDSTOP_3   		PB7 		// Filament Detection Sensor
 
-#define KEY1        PB13 //后退
-#define KEY2        PB12 //前进
+#define KEY_REVERSE 		PB11 		// Reverse
+#define KEY_FORWARD 		PB10 		// Forward
 
-#define EN_PIN      PA6 //使能
-#define DIR_PIN     PA7 //方向
-#define STEP_PIN    PC13 //步
-#define UART        PB1 //软串口
+#define LED_REVERSE 		PA5 		// Reverse
+#define LED_FORWARD 		PA4 		// Forward
 
-#define DUANLIAO    PB15 //断料
-#define ERR_LED     PA15 //指示灯
-#define START_LED   PA8  //指示灯
+#define EN_PIN      		PA6 		// Stepper Enable
+#define DIR_PIN     		PA7 		// Stepper Direction
+#define STEP_PIN    		PC13 		// Stepper Step
+#define UART        		PB1 		// UART Port
 
-#define DRIVER_ADDRESS 0b00 // TMC Driver address according to MS1 and MS2
-#define R_SENSE 0.11f // Match to your driver
+#define FILAMENT_OUTPUT  	PB15 		// Filament Detection Output
+#define ERR_LED     		PA2 		// Error LED
+#define STATUS_LED   		PA3  		// Status LED
 
-#define SPEED       300  //转速(单位：r/min)
-#define Move_Divide_NUM			((int32_t)(64))		//(每步柔性件控制细分量)
-#define VACTRUAL_VALUE (uint32_t)(SPEED*Move_Divide_NUM*200/60/0.715)   //VACTUAL寄存器值
+#define DRIVER_ADDRESS 		0b00 		// TMC Driver address according to MS1 and MS2
+#define R_SENSE 			0.11f 		// Match to your driver
 
-#define STOP 0				//停止
-#define I_CURRENT (600)		//电流
-#define WRITE_EN_PIN(x) digitalWrite(EN_PIN,x)//使能EN引脚
-#define FORWARD		1//耗材方向
-#define BACK		0
+#define SPEED       		300  		// Rotation speed (r/min)
+#define Move_Divide_NUM	((int32_t)(64))	// Micro Stepping
+#define VACTRUAL_VALUE (uint32_t)(SPEED*Move_Divide_NUM*200/60/0.715)   // VACTUAL Register Value
 
-#define DEBUG 0
+#define STOP 				0			// Stop
+#define I_CURRENT 			(600)		// Current
+#define WRITE_EN_PIN(x) digitalWrite(EN_PIN,x)// Enable Pin Write
+#define FORWARD				1			// Filament Direction
+#define BACK				0
 
-//定义结构体存储缓冲器中各传感器的的状态
-typedef struct Buffer
-{
-	//buffer1
+#define DEBUG 				0
+
+// Input states
+typedef struct Buffer {
 	bool buffer1_pos1_sensor_state;	
 	bool buffer1_pos2_sensor_state;		
 	bool buffer1_pos3_sensor_state;		
 	bool buffer1_material_swtich_state;	
-	bool key1;
-	bool key2;
-	
-}Buffer;
+	bool key_reverse;
+	bool key_forward;
+} Buffer;
 
-//电机状态控制枚举
-typedef enum
-{
-	Forward=0,//向前
-	Stop,		//停止
-	Back		//后退
-}Motor_State;
+// Output stepper states
+typedef enum {
+	Forward = 0,	// Forward
+	Stop,			// Stop
+	Back			// Reverse
+} Motor_State;
 
 extern void buffer_sensor_init();
 extern void buffer_motor_init();
@@ -97,10 +70,9 @@ extern void timer_it_callback();
 extern void buffer_debug(void);
 
 extern bool is_error;
-extern uint32_t front_time;//前进时间
+extern uint32_t front_time;	// Forward time
 extern uint32_t timeout;
 extern bool is_front;
 extern TMC2209Stepper driver;
-
 
 #endif
