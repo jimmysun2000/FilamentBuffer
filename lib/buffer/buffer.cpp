@@ -42,7 +42,7 @@ void buffer_loop() {
 		// every 500ms
 		if(millis() - lastToggleTime >= 500) {
 			lastToggleTime = millis();
-			digitalToggle(ERR_LED);
+			digitalToggle(STATUS_LED);
 		}
 
 		// Read sensors
@@ -215,7 +215,6 @@ void motor_control(void) {
 		
 		// Turn off signal for FILAMENT_OUTPUT
 		digitalWrite(FILAMENT_OUTPUT, 1);
-		digitalWrite(STATUS_LED, 1);
 
 		is_front = false;
 		front_time = 0;
@@ -227,7 +226,6 @@ void motor_control(void) {
 		
 	// Filament detected, turn on LED
 	digitalWrite(FILAMENT_OUTPUT, 0);
-	digitalWrite(STATUS_LED, 0);
 
 	// Stop stepper on error
 	if (is_error) {
