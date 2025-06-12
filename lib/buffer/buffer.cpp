@@ -174,7 +174,7 @@ void motor_control(void) {
 			
 		driver.shaft(BACK);
 		digitalWrite(LED_REVERSE, 0);
-		driver.VACTUAL(VACTRUAL_VALUE);
+		driver.VACTUAL(VACTUAL_BUTTON);
 		while(!digitalRead(KEY_REVERSE)); // Wait for button to be released
 					
 		digitalWrite(LED_REVERSE, 1);
@@ -194,7 +194,7 @@ void motor_control(void) {
 		
     	driver.shaft(FORWARD);
 		digitalWrite(LED_FORWARD, 0);
-		driver.VACTUAL(VACTRUAL_VALUE);
+		driver.VACTUAL(VACTUAL_BUTTON);
 		while(!digitalRead(KEY_FORWARD));
 					
 		digitalWrite(LED_FORWARD,1);
@@ -269,7 +269,7 @@ void motor_control(void) {
 				driver.VACTUAL(STOP);//上次是后退，先停下再前进
 			}
 			driver.shaft(FORWARD);
-			driver.VACTUAL(VACTRUAL_VALUE);
+			driver.VACTUAL(VACTUAL_NORMAL);
 
 		} break;
 		case Stop://停止
@@ -288,7 +288,7 @@ void motor_control(void) {
 				driver.VACTUAL(STOP);//上次是前进，先停下再后退
 			}
 			driver.shaft(BACK);
-			driver.VACTUAL(VACTRUAL_VALUE);
+			driver.VACTUAL(VACTUAL_NORMAL);
 		} break;
 	}
 }

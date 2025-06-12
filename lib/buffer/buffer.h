@@ -11,8 +11,8 @@
 
 #define ENDSTOP_3   		PB7 		// Filament Detection Sensor
 
-#define KEY_REVERSE 		PB11 		// Reverse
-#define KEY_FORWARD 		PB10 		// Forward
+#define KEY_REVERSE 		PB13 		// Reverse
+#define KEY_FORWARD 		PB12 		// Forward
 
 #define LED_REVERSE 		PA5 		// Reverse
 #define LED_FORWARD 		PA4 		// Forward
@@ -29,12 +29,14 @@
 #define DRIVER_ADDRESS 		0b00 		// TMC Driver address according to MS1 and MS2
 #define R_SENSE 			0.11f 		// Match to your driver
 
-#define SPEED       		300  		// Rotation speed (r/min)
+#define SPEED_NORMAL_RPM    100    // default buffer speed, capable of deliverying 100 mm^3/s of filament
+#define SPEED_BUTTON_RPM    300    // speed while a key is held
 #define Move_Divide_NUM	((int32_t)(64))	// Micro Stepping
-#define VACTRUAL_VALUE (uint32_t)(SPEED*Move_Divide_NUM*200/60/0.715)   // VACTUAL Register Value
+#define VACTUAL_NORMAL  (uint32_t)(SPEED_NORMAL_RPM * Move_Divide_NUM * 200 / 60 / 0.715f)
+#define VACTUAL_BUTTON  (uint32_t)(SPEED_BUTTON_RPM * Move_Divide_NUM * 200 / 60 / 0.715f)
 
 #define STOP 				0			// Stop
-#define I_CURRENT 			(600)		// Current
+#define I_CURRENT 			(500)		// Current
 #define WRITE_EN_PIN(x) digitalWrite(EN_PIN,x)// Enable Pin Write
 #define FORWARD				1			// Filament Direction
 #define BACK				0
