@@ -10,6 +10,7 @@ const uint32_t DEFAULT_TIMEOUT = 30000;
 uint32_t timeout = 30000; 				// timeout in ms
 bool is_error = false;					// error state
 String serial_buf;
+static uint16_t _currentCached = CURRENT_NORMAL_MA;
 
 static HardwareTimer timer(TIM6);		// Error timer
 
@@ -147,7 +148,7 @@ void buffer_motor_init() {
 	driver.beginSerial(9600);
 	driver.I_scale_analog(false);
 	driver.toff(5);                 	// Enables driver in software
-	driver.rms_current(I_CURRENT);      // Set motor RMS current
+	driver.rms_current(CURRENT_NORMAL_MA);
 	driver.microsteps(Move_Divide_NUM); // Set microsteps to 1/16th
 	driver.VACTUAL(STOP);           	// Set velocity
 	driver.en_spreadCycle(true);
@@ -163,6 +164,14 @@ void read_sensor_state(void) {
 	buffer.key_forward = digitalRead(KEY_FORWARD);
 }
 
+static inline void _setMotorCurrent(uint16_t mA)
+{
+    if (mA != _currentCached) {
+        driver.rms_current(mA);
+        _currentCached = mA;
+    }
+}
+
 void motor_control(void) {
 	static Motor_State last_motor_state = Stop;
 	
@@ -171,7 +180,8 @@ void motor_control(void) {
 	if (!digitalRead(KEY_REVERSE)) {
 		WRITE_EN_PIN(0); 		// Enable stepper
 		driver.VACTUAL(STOP);	// Stop
-			
+		_setMotorCurrent(CURRENT_BUTTON_MA);      // boost current
+
 		driver.shaft(BACK);
 		digitalWrite(LED_REVERSE, 0);
 		driver.VACTUAL(VACTUAL_BUTTON);
@@ -191,7 +201,8 @@ void motor_control(void) {
 	else if (!digitalRead(KEY_FORWARD)) {
 		WRITE_EN_PIN(0);
 		driver.VACTUAL(STOP);
-		
+		_setMotorCurrent(CURRENT_BUTTON_MA);      // boost current
+
     	driver.shaft(FORWARD);
 		digitalWrite(LED_FORWARD, 0);
 		driver.VACTUAL(VACTUAL_BUTTON);
@@ -268,6 +279,7 @@ void motor_control(void) {
 			if (last_motor_state == Back) {
 				driver.VACTUAL(STOP);//上次是后退，先停下再前进
 			}
+			_setMotorCurrent(CURRENT_NORMAL_MA);      // steady current
 			driver.shaft(FORWARD);
 			driver.VACTUAL(VACTUAL_NORMAL);
 
@@ -287,6 +299,7 @@ void motor_control(void) {
 			if (last_motor_state == Forward) {
 				driver.VACTUAL(STOP);//上次是前进，先停下再后退
 			}
+			_setMotorCurrent(CURRENT_NORMAL_MA);      // steady current
 			driver.shaft(BACK);
 			driver.VACTUAL(VACTUAL_NORMAL);
 		} break;

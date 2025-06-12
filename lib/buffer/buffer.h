@@ -36,7 +36,8 @@
 #define VACTUAL_BUTTON  (uint32_t)(SPEED_BUTTON_RPM * Move_Divide_NUM * 200 / 60 / 0.715f)
 
 #define STOP 				0			// Stop
-#define I_CURRENT 			(500)		// Current
+#define CURRENT_NORMAL_MA   600   // steady-state current
+#define CURRENT_BUTTON_MA   900   // boost current while a key is held
 #define WRITE_EN_PIN(x) digitalWrite(EN_PIN,x)// Enable Pin Write
 #define FORWARD				1			// Filament Direction
 #define BACK				0
