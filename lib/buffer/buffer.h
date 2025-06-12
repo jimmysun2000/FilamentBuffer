@@ -29,15 +29,17 @@
 #define DRIVER_ADDRESS 		0b00 		// TMC Driver address according to MS1 and MS2
 #define R_SENSE 			0.11f 		// Match to your driver
 
-#define SPEED_NORMAL_RPM    100    // default buffer speed, capable of deliverying 100 mm^3/s of filament
-#define SPEED_BUTTON_RPM    300    // speed while a key is held
+#define SPEED_NORMAL_RPM    (uint32_t)(33/0.22)    // default buffer speed, capable of deliverying 33 mm^3/s (150 rpm) of filament
+// #define SPEED_NORMAL_RPM    (uint32_t)(66/0.22)    // default buffer speed, capable of deliverying 66 mm^3/s (300 rpm) of filament
+#define SPEED_BUTTON_RPM    (uint32_t)(66/0.22)    // speed while a key is held (66 mm^3/s)
 #define Move_Divide_NUM	((int32_t)(64))	// Micro Stepping
 #define VACTUAL_NORMAL  (uint32_t)(SPEED_NORMAL_RPM * Move_Divide_NUM * 200 / 60 / 0.715f)
 #define VACTUAL_BUTTON  (uint32_t)(SPEED_BUTTON_RPM * Move_Divide_NUM * 200 / 60 / 0.715f)
 
 #define STOP 				0			// Stop
-#define CURRENT_NORMAL_MA   600   // steady-state current
-#define CURRENT_BUTTON_MA   900   // boost current while a key is held
+#define CURRENT_NORMAL_MA   300   // steady-state current for 33 mm^3/s feed rate
+// #define CURRENT_NORMAL_MA   900   // steady-state current for 66 mm^3/s feed rate
+#define CURRENT_BUTTON_MA   900   // boost current while a key is held (66 mm^3/s)
 #define WRITE_EN_PIN(x) digitalWrite(EN_PIN,x)// Enable Pin Write
 #define FORWARD				1			// Filament Direction
 #define BACK				0
