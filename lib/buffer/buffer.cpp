@@ -143,7 +143,7 @@ void buffer_motor_init() {
 	pinMode(STEP_PIN, OUTPUT);
 	pinMode(DIR_PIN, OUTPUT);
 	digitalWrite(EN_PIN, LOW);      	// Enable driver in hardware
-	driver.begin();                  	// UART: Init SW UART (if selected) with default 115200 baudrate
+	// driver.begin();                  	// UART: Init SW UART (if selected) with default 115200 baudrate
 	driver.beginSerial(9600);
 	driver.I_scale_analog(false);
 	driver.toff(5);                 	// Enables driver in software
