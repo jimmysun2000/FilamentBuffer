@@ -11,11 +11,11 @@
 
 #define ENDSTOP_3   		PB7 		// Filament Detection Sensor
 
-#define KEY_REVERSE 		PB13 		// Reverse
-#define KEY_FORWARD 		PB12 		// Forward
+#define KEY_REVERSE 		PB10 		// Reverse
+#define KEY_FORWARD 		PB11 		// Forward
 
-#define LED_REVERSE 		PA5 		// Reverse
-#define LED_FORWARD 		PA4 		// Forward
+#define LED_REVERSE 		PA4 		// Reverse
+#define LED_FORWARD 		PA5 		// Forward
 
 #define EN_PIN      		PA6 		// Stepper Enable
 #define DIR_PIN     		PA7 		// Stepper Direction
@@ -23,8 +23,8 @@
 #define UART        		PB1 		// UART Port
 
 #define FILAMENT_OUTPUT  	PB15 		// Filament Detection Output
-#define ERR_LED     		PA2 		// Error LED
-#define STATUS_LED   		PA3  		// Status LED
+#define ERR_LED     		PA3 		// Error LED
+#define STATUS_LED   		PA2  		// Status LED
 
 #define DRIVER_ADDRESS 		0b00 		// TMC Driver address according to MS1 and MS2
 #define R_SENSE 			0.11f 		// Match to your driver

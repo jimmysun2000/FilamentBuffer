@@ -7,7 +7,7 @@ bool is_front = false; 					// Filament is pushed to the front
 uint32_t front_time = 0; 				// Filament time in front position
 const int EEPROM_ADDR_TIMEOUT = 0;
 const uint32_t DEFAULT_TIMEOUT = 30000;
-uint32_t timeout = 30000; 				// timeout in ms
+uint32_t timeout = 60000; 				// timeout in ms
 bool is_error = false;					// error state
 String serial_buf;
 static uint16_t _currentCached = CURRENT_NORMAL_MA;
@@ -136,6 +136,12 @@ void buffer_sensor_init() {
 	pinMode(STATUS_LED, OUTPUT);
 	pinMode(LED_REVERSE, OUTPUT);
 	pinMode(LED_FORWARD, OUTPUT);
+
+	digitalWrite(FILAMENT_OUTPUT, HIGH);
+	digitalWrite(ERR_LED, HIGH);
+	digitalWrite(STATUS_LED, HIGH);
+	digitalWrite(LED_REVERSE, HIGH);
+	digitalWrite(LED_FORWARD, HIGH);
 }
 
 void buffer_motor_init() {
@@ -178,16 +184,16 @@ void motor_control(void) {
 	// Control stepper using buttons
 	// Reverse key pressed
 	if (!digitalRead(KEY_REVERSE)) {
+		digitalWrite(LED_FORWARD, 1);
+		digitalWrite(LED_REVERSE, 0);
 		WRITE_EN_PIN(0); 		// Enable stepper
 		driver.VACTUAL(STOP);	// Stop
 		_setMotorCurrent(CURRENT_BUTTON_MA);      // boost current
 
 		driver.shaft(BACK);
-		digitalWrite(LED_REVERSE, 0);
 		driver.VACTUAL(VACTUAL_BUTTON);
 		while(!digitalRead(KEY_REVERSE)); // Wait for button to be released
 					
-		digitalWrite(LED_REVERSE, 1);
 		driver.VACTUAL(STOP);	// Stop
 		motor_state = Stop;
 
@@ -195,20 +201,21 @@ void motor_control(void) {
 		front_time = 0;
 		is_error = false;
 		WRITE_EN_PIN(1); 		// Disable stepper
+		digitalWrite(LED_REVERSE, 1);
 	}
 
 	// Forward key pressed
 	else if (!digitalRead(KEY_FORWARD)) {
+		digitalWrite(LED_FORWARD, 0);
+		digitalWrite(LED_REVERSE, 1);
 		WRITE_EN_PIN(0);
 		driver.VACTUAL(STOP);
 		_setMotorCurrent(CURRENT_BUTTON_MA);      // boost current
 
     	driver.shaft(FORWARD);
-		digitalWrite(LED_FORWARD, 0);
 		driver.VACTUAL(VACTUAL_BUTTON);
 		while(!digitalRead(KEY_FORWARD));
 					
-		digitalWrite(LED_FORWARD,1);
 		driver.VACTUAL(STOP);
 		motor_state = Stop;
 
@@ -216,6 +223,7 @@ void motor_control(void) {
 		front_time = 0;
 		is_error = false;
 		WRITE_EN_PIN(1);
+		digitalWrite(LED_FORWARD, 1);
 	}
 	
 	// Detect filament
@@ -231,7 +239,8 @@ void motor_control(void) {
 		front_time = 0;
 		is_error = false;
 		WRITE_EN_PIN(1);
-
+		digitalWrite(LED_FORWARD, 1);
+		digitalWrite(LED_REVERSE, 1);
 		return;
 	}
 		
@@ -244,6 +253,8 @@ void motor_control(void) {
 		motor_state = Stop;
 		WRITE_EN_PIN(1);
 		digitalWrite(ERR_LED, 0);
+		digitalWrite(LED_FORWARD, 1);
+		digitalWrite(LED_REVERSE, 1);
 		return;
 	}
 
@@ -274,6 +285,7 @@ void motor_control(void) {
 	switch(motor_state) {
 		case Forward://向前
 		{
+			digitalWrite(ERR_LED, 1);
 			digitalWrite(LED_FORWARD, 0);
 			WRITE_EN_PIN(0);
 			if (last_motor_state == Back) {
@@ -294,6 +306,7 @@ void motor_control(void) {
 		} break;
 		case Back://向后
 		{
+			digitalWrite(ERR_LED, 1);
 			digitalWrite(LED_REVERSE, 0);
 			WRITE_EN_PIN(0);
 			if (last_motor_state == Forward) {
