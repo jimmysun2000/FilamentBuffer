@@ -14,6 +14,9 @@
 #define KEY_REVERSE 		PB10 		// Reverse
 #define KEY_FORWARD 		PB11 		// Forward
 
+#define KEY_REVERSE2 		PB13 		// Reverse
+#define KEY_FORWARD2 		PB12 		// Forward
+
 #define LED_REVERSE 		PA4 		// Reverse
 #define LED_FORWARD 		PA5 		// Forward
 

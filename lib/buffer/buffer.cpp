@@ -127,8 +127,10 @@ void buffer_sensor_init() {
 	pinMode(HALL2, INPUT);
 	pinMode(HALL3, INPUT);
 	pinMode(ENDSTOP_3, INPUT);
-	pinMode(KEY_REVERSE, INPUT);
-	pinMode(KEY_FORWARD, INPUT);
+	pinMode(KEY_REVERSE, INPUT_PULLUP);
+	pinMode(KEY_FORWARD, INPUT_PULLUP);
+	pinMode(KEY_REVERSE2, INPUT_PULLUP);
+	pinMode(KEY_FORWARD2, INPUT_PULLUP);
 
 	// Initialise LEDs
 	pinMode(FILAMENT_OUTPUT, OUTPUT);
@@ -166,8 +168,8 @@ void read_sensor_state(void) {
 	buffer.buffer1_pos2_sensor_state = digitalRead(HALL2);	
 	buffer.buffer1_pos3_sensor_state = digitalRead(HALL1);		
 	buffer.buffer1_material_swtich_state = digitalRead(ENDSTOP_3);	
-	buffer.key_reverse = digitalRead(KEY_REVERSE);
-	buffer.key_forward = digitalRead(KEY_FORWARD);
+	buffer.key_reverse = digitalRead(KEY_REVERSE) & digitalRead(KEY_REVERSE2);
+	buffer.key_forward = digitalRead(KEY_FORWARD) & digitalRead(KEY_FORWARD2);
 }
 
 static inline void _setMotorCurrent(uint16_t mA)
@@ -183,7 +185,7 @@ void motor_control(void) {
 	
 	// Control stepper using buttons
 	// Reverse key pressed
-	if (!digitalRead(KEY_REVERSE)) {
+	if (!digitalRead(KEY_REVERSE) | !digitalRead(KEY_REVERSE2)) {
 		digitalWrite(LED_FORWARD, 1);
 		digitalWrite(LED_REVERSE, 0);
 		WRITE_EN_PIN(0); 		// Enable stepper
@@ -192,7 +194,7 @@ void motor_control(void) {
 
 		driver.shaft(BACK);
 		driver.VACTUAL(VACTUAL_BUTTON);
-		while(!digitalRead(KEY_REVERSE)); // Wait for button to be released
+		while(!digitalRead(KEY_REVERSE) | !digitalRead(KEY_REVERSE2)); // Wait for button to be released
 					
 		driver.VACTUAL(STOP);	// Stop
 		motor_state = Stop;
@@ -205,7 +207,7 @@ void motor_control(void) {
 	}
 
 	// Forward key pressed
-	else if (!digitalRead(KEY_FORWARD)) {
+	else if (!digitalRead(KEY_FORWARD) | !digitalRead(KEY_FORWARD2)) {
 		digitalWrite(LED_FORWARD, 0);
 		digitalWrite(LED_REVERSE, 1);
 		WRITE_EN_PIN(0);
@@ -214,7 +216,7 @@ void motor_control(void) {
 
     	driver.shaft(FORWARD);
 		driver.VACTUAL(VACTUAL_BUTTON);
-		while(!digitalRead(KEY_FORWARD));
+		while(!digitalRead(KEY_FORWARD) | !digitalRead(KEY_FORWARD2));
 					
 		driver.VACTUAL(STOP);
 		motor_state = Stop;
