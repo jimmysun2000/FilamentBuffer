@@ -32,6 +32,24 @@ static inline void _setMotorCurrent(uint16_t mA) {
 	}
 }
 
+static bool _lastRst{true};          // active-low → start HIGH
+
+void _pollRstButton() {
+    bool now = _readKey(swRstPin);   // LOW when pressed
+
+    if (!now && _lastRst) {          // 0→1 edge (= key press)
+        /* debounce delay, optional */
+        delay(5);
+        if (!_readKey(swRstPin)) {
+            /* illuminate Override-LED for user feedback */
+            _writeLed(ledOverridePin, LOW);
+            delay(50);
+            NVIC_SystemReset();      // never returns
+        }
+    }
+    _lastRst = now;
+}
+
 static void _updateOverrideAndCancel() {
     bool ovNow  = _readKey(swOverridePin);
     bool cnNow  = _readKey(swCancelPin);
@@ -159,6 +177,7 @@ static void _initIoExpander() {
         _io.pinMode(p, OUTPUT);
         _io.digitalWrite(p, HIGH);
     }
+	_writeLed(ledOverridePin, LOW);
 }
 
 void bufferInit() {
@@ -184,7 +203,6 @@ void bufferInit() {
 	driver.VACTUAL(STOP);
     driver.en_spreadCycle(true);
     driver.pwm_autoscale(true);
-	_writeLed(ledOverridePin, LOW);
 
 	delay(1000);
 
@@ -216,6 +234,7 @@ void bufferLoop() {
 		_toggleLed(ledStatusPin);
 	}
 
+	_pollRstButton();
 	_updateOverrideAndCancel();
 	_processDirectionKeys();
 	_runOneClickJob();

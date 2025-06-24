@@ -121,5 +121,6 @@ extern void bufferInit();
 extern void bufferLoop();
 extern void _timerInterruptHandler();
 extern void _bufferDebug();
+extern void _pollRstButton();
 
 #endif
