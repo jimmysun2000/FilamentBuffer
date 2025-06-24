@@ -86,6 +86,19 @@ namespace speed {
 
 extern SpeedTier currentSpeedTier;
 
+/* distance per click [millimetres] in normal mode */
+constexpr float kLoadDistanceMm{120.0f};
+/* motor micro-steps per full rev */
+constexpr uint32_t kMicroSteps{Move_Divide_NUM * 200};
+/* filament displacement per full rev [mm]  (≈ π·Ødrive-gear) */
+constexpr float kMmPerRev{22.0f};
+/* derived run-time (ms) = D / v  */
+constexpr uint32_t _timeForDistance(float mm, uint32_t rpm) {
+    const float rev  = mm / kMmPerRev;
+    const float sec  = rev / (rpm / 60.0f);
+    return uint32_t(sec * 1000.0f + 0.5f);
+}
+
 // Input states
 struct BufferState {
     bool hallPos1;

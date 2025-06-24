@@ -19,6 +19,102 @@ static uint32_t 	 _lastBlink;
 inline void _writeLed(uint8_t pin, bool level)       { _io.digitalWrite(pin, level); }
 inline void _toggleLed(uint8_t pin)                  { _io.digitalWrite(pin, !_io.digitalRead(pin)); }
 inline bool _readKey(uint8_t pin)                    { return _io.digitalRead(pin); }
+static bool        _manualOverride{true};
+static bool        _moveActive{false};
+static Motor_State _moveDir{Stop};
+static uint32_t    _moveStopMillis{0};
+static bool _lastOverride{true}, _lastCancel{true}, _lastFwd{true}, _lastRev{true};
+
+static inline void _setMotorCurrent(uint16_t mA) {
+    if (mA != _currentCached) {
+        driver.rms_current(mA);
+        _currentCached = mA;
+	}
+}
+
+static void _updateOverrideAndCancel() {
+    bool ovNow  = _readKey(swOverridePin);
+    bool cnNow  = _readKey(swCancelPin);
+
+    /* override toggle on rising edge */
+    if (!ovNow && _lastOverride) {
+        _manualOverride = !_manualOverride;
+        _writeLed(ledOverridePin, _manualOverride ? LOW : HIGH);
+        /* kill any running one-click job when entering manual */
+        if (_manualOverride && _moveActive) _moveActive = false;
+    }
+    _lastOverride = ovNow;
+
+    /* cancel key: stop immediately */
+    if (!cnNow && _lastCancel) {
+        if (_moveActive) _moveActive = false;
+        driver.VACTUAL(STOP);
+        WRITE_EN_PIN(1);
+    }
+    _lastCancel = cnNow;
+}
+
+static void _processDirectionKeys() {
+    bool fwd = _readKey(swForwardPin);
+    bool rev = _readKey(swReversePin);
+
+    /* ───── manual: jog while held ───── */
+    if (_manualOverride) {
+        if (!fwd) {
+            _setMotorCurrent(CURRENT_BUTTON_MA);
+            _moveActive = false;
+            driver.shaft(FORWARD);
+            driver.VACTUAL(speed::vTable[uint8_t(currentSpeedTier)]);
+            WRITE_EN_PIN(0);
+        } else if (!rev) {
+            _setMotorCurrent(CURRENT_BUTTON_MA);
+            _moveActive = false;
+            driver.shaft(BACK);
+            driver.VACTUAL(speed::vTable[uint8_t(currentSpeedTier)]);
+            WRITE_EN_PIN(0);
+        } else {
+            /* no key held – stop */
+            driver.VACTUAL(STOP);
+            WRITE_EN_PIN(1);
+        }
+        _lastFwd = fwd;
+        _lastRev = rev;
+        return;
+    }
+
+    /* ───── normal: one-click move job ───── */
+    /* rising edge triggers a new move if none running */
+    if (!_moveActive && !fwd && _lastFwd) {
+        _moveDir         = Forward;
+        _moveActive      = true;
+        _moveStopMillis  = millis() +
+            _timeForDistance(kLoadDistanceMm, speed::rpmMed);             // use MED rpm for timing
+    } else if (!_moveActive && !rev && _lastRev) {
+        _moveDir         = Back;
+        _moveActive      = true;
+        _moveStopMillis  = millis() +
+            _timeForDistance(kLoadDistanceMm, speed::rpmMed);
+    }
+    _lastFwd = fwd;
+    _lastRev = rev;
+}
+
+static void _runOneClickJob() {
+    if (!_moveActive) return;
+
+    if (millis() >= _moveStopMillis) {
+        /* finished */
+        driver.VACTUAL(STOP);
+        WRITE_EN_PIN(1);
+        _moveActive = false;
+        return;
+    }
+
+    /* ensure the motor is running in the correct direction */
+    driver.shaft(_moveDir == Forward ? FORWARD : BACK);
+    driver.VACTUAL(speed::vTable[uint8_t(currentSpeedTier)]);
+    WRITE_EN_PIN(0);
+}
 
 static void _updateSpeedTier() {
     /* active-low buttons */
@@ -88,6 +184,7 @@ void bufferInit() {
 	driver.VACTUAL(STOP);
     driver.en_spreadCycle(true);
     driver.pwm_autoscale(true);
+	_writeLed(ledOverridePin, LOW);
 
 	delay(1000);
 
@@ -112,19 +209,16 @@ void bufferInit() {
     _lastBlink = millis();
 }
 
-static inline void _setMotorCurrent(uint16_t mA) {
-    if (mA != _currentCached) {
-        driver.rms_current(mA);
-        _currentCached = mA;
-	}
-}
-
 void bufferLoop() {
 	/* heartbeat every 500 ms */
 	if (millis() - _lastBlink >= 500) {
 		_lastBlink = millis();
 		_toggleLed(ledStatusPin);
 	}
+
+	_updateOverrideAndCancel();
+	_processDirectionKeys();
+	_runOneClickJob();
 
 	/* poll speed keys & set speed leds */
 	_updateSpeedTier();
@@ -137,7 +231,7 @@ void bufferLoop() {
 	_buf.keyReverse      = !_readKey(swReversePin);
 	_buf.keyForward      = !_readKey(swForwardPin);
 
-        motorControl();
+	motorControl();
 }
 
 void motorControl(void) {
