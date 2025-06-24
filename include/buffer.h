@@ -56,13 +56,7 @@ enum McpPin : uint8_t {
 #define DRIVER_ADDRESS      0b00
 #define R_SENSE             0.11f
 
-#define SPEED_NORMAL_RPM    (uint32_t)(33/0.22)    // default buffer speed, capable of deliverying 33 mm^3/s (150 rpm) of filament
-// #define SPEED_NORMAL_RPM    (uint32_t)(66/0.22)    // default buffer speed, capable of deliverying 66 mm^3/s (300 rpm) of filament
-#define SPEED_BUTTON_RPM    (uint32_t)(66/0.22)    // speed while a key is held (66 mm^3/s)
 #define Move_Divide_NUM	((int32_t)(64))	// Micro Stepping
-#define VACTUAL_NORMAL  (uint32_t)(SPEED_NORMAL_RPM * Move_Divide_NUM * 200 / 60 / 0.715f)
-#define VACTUAL_BUTTON  (uint32_t)(SPEED_BUTTON_RPM * Move_Divide_NUM * 200 / 60 / 0.715f)
-
 #define STOP 				0			// Stop
 #define CURRENT_NORMAL_MA   300   // steady-state current for 33 mm^3/s feed rate
 // #define CURRENT_NORMAL_MA   900   // steady-state current for 66 mm^3/s feed rate
@@ -71,7 +65,26 @@ enum McpPin : uint8_t {
 #define FORWARD				1			// Filament Direction
 #define BACK				0
 
-#define DEBUG 				0
+enum class SpeedTier : uint8_t {Low = 0, Medium, High, Count};
+
+namespace speed {
+    /* delivered filament-flow (mm³ s⁻¹)  →  mechanical rpm */
+    constexpr uint32_t rpmLow    = (33/0.22);   //  ≈ 33 mm³ s⁻¹
+    constexpr uint32_t rpmMed    = (50/0.22);   //  ≈ 50 mm³ s⁻¹
+    constexpr uint32_t rpmHigh   = (66/0.22);   //  ≈ 66 mm³ s⁻¹
+
+    /* TMC2209 VACTUAL = rpm · (µstep · 200) / (60 · 0.715)            *
+     * with µstep = 64   →   scale ≈ 298.692                           */
+    constexpr float    _k       = (Move_Divide_NUM * 200.0f) / (60.0f * 0.715f);
+
+    constexpr uint32_t vLow     = uint32_t(rpmLow  * _k + 0.5f);
+    constexpr uint32_t vMed     = uint32_t(rpmMed  * _k + 0.5f);
+    constexpr uint32_t vHigh    = uint32_t(rpmHigh * _k + 0.5f);
+
+    constexpr uint32_t vTable[static_cast<uint8_t>(SpeedTier::Count)] = {vLow, vMed, vHigh};
+}
+
+extern SpeedTier currentSpeedTier;
 
 // Input states
 struct BufferState {

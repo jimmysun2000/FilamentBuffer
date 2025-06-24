@@ -3,6 +3,8 @@
 Adafruit_MCP23X17 _io;
 TMC2209Stepper driver(UART, UART, R_SENSE, DRIVER_ADDRESS);
 HardwareTimer      _errorTimer{TIM6};
+SpeedTier currentSpeedTier{SpeedTier::Medium};
+static bool _lastInc{true}, _lastDec{true};
 
 static BufferState   _buf{};
 static Motor_State   _motorState{Stop};
@@ -13,10 +15,37 @@ static uint32_t      _frontTime{0};
 static uint32_t      _timeout{60000};
 static uint16_t      _currentCached{CURRENT_NORMAL_MA};
 static String        _serialBuffer;
-
+static uint32_t 	 _lastBlink;
 inline void _writeLed(uint8_t pin, bool level)       { _io.digitalWrite(pin, level); }
 inline void _toggleLed(uint8_t pin)                  { _io.digitalWrite(pin, !_io.digitalRead(pin)); }
 inline bool _readKey(uint8_t pin)                    { return _io.digitalRead(pin); }
+
+static void _updateSpeedTier() {
+    /* active-low buttons */
+    bool inc = _readKey(swSpeedIncPin);
+    bool dec = _readKey(swSpeedDecPin);
+
+    /* rising-edge on either key? */
+    if (!inc && _lastInc) {
+        currentSpeedTier = static_cast<SpeedTier>(
+            (static_cast<uint8_t>(currentSpeedTier) + 1) %
+            static_cast<uint8_t>(SpeedTier::Count));
+    }
+    if (!dec && _lastDec) {
+        currentSpeedTier = static_cast<SpeedTier>(
+            (static_cast<uint8_t>(currentSpeedTier) + 2) %
+            static_cast<uint8_t>(SpeedTier::Count));    // -1 mod 3
+    }
+    _lastInc = inc;
+    _lastDec = dec;
+}
+
+/* refresh the three indicator LEDs */
+static void _showSpeedTier() {
+    _writeLed(ledSpeedLowPin,    currentSpeedTier == SpeedTier::Low    ? LOW : HIGH);
+    _writeLed(ledSpeedMediumPin, currentSpeedTier == SpeedTier::Medium ? LOW : HIGH);
+    _writeLed(ledSpeedHighPin,   currentSpeedTier == SpeedTier::High   ? LOW : HIGH);
+}
 
 static void _initIoExpander() {
     _io.begin_I2C(MCP_ADDR);
@@ -79,6 +108,8 @@ void bufferInit() {
     _errorTimer.setOverflow(1000);
     _errorTimer.attachInterrupt(_timerInterruptHandler);
     _errorTimer.resume();
+
+    _lastBlink = millis();
 }
 
 static inline void _setMotorCurrent(uint16_t mA) {
@@ -89,24 +120,24 @@ static inline void _setMotorCurrent(uint16_t mA) {
 }
 
 void bufferLoop() {
-    uint32_t lastBlink = millis();
+	/* heartbeat every 500 ms */
+	if (millis() - _lastBlink >= 500) {
+		_lastBlink = millis();
+		_toggleLed(ledStatusPin);
+	}
 
-    for (;;) {
-        /* heartbeat every 500 ms */
-        if (millis() - lastBlink >= 500) {
-            lastBlink = millis();
-            _toggleLed(ledStatusPin);
-        }
+	/* poll speed keys & set speed leds */
+	_updateSpeedTier();
+	_showSpeedTier();
 
-        _buf.hallPos1        = digitalRead(HALL3);
-        _buf.hallPos2        = digitalRead(HALL2);
-        _buf.hallPos3        = digitalRead(HALL1);
-        _buf.materialPresent = !digitalRead(ENDSTOP_3);   // active-low
-        _buf.keyReverse      = !_readKey(swReversePin);   // pressed = true
-        _buf.keyForward      = !_readKey(swForwardPin);
+	_buf.hallPos1        = digitalRead(HALL3);
+	_buf.hallPos2        = digitalRead(HALL2);
+	_buf.hallPos3        = digitalRead(HALL1);
+	_buf.materialPresent = !digitalRead(ENDSTOP_3);
+	_buf.keyReverse      = !_readKey(swReversePin);
+	_buf.keyForward      = !_readKey(swForwardPin);
 
         motorControl();
-    }
 }
 
 void motorControl(void) {
@@ -119,7 +150,7 @@ void motorControl(void) {
 		_setMotorCurrent(CURRENT_BUTTON_MA);      // boost current
 
 		driver.shaft(BACK);
-		driver.VACTUAL(VACTUAL_BUTTON);
+		driver.VACTUAL(speed::vTable[static_cast<uint8_t>(currentSpeedTier)]);
 		while(_buf.keyReverse); // Wait for button to be released
 					
 		driver.VACTUAL(STOP);	// Stop
@@ -140,7 +171,7 @@ void motorControl(void) {
 		_setMotorCurrent(CURRENT_BUTTON_MA);      // boost current
 
     	driver.shaft(FORWARD);
-		driver.VACTUAL(VACTUAL_BUTTON);
+		driver.VACTUAL(speed::vTable[static_cast<uint8_t>(currentSpeedTier)]);
 		while(_buf.keyForward);
 					
 		driver.VACTUAL(STOP);
@@ -216,7 +247,7 @@ void motorControl(void) {
 			}
 			_setMotorCurrent(CURRENT_NORMAL_MA);      // steady current
 			driver.shaft(FORWARD);
-			driver.VACTUAL(VACTUAL_NORMAL);
+			driver.VACTUAL(speed::vTable[static_cast<uint8_t>(currentSpeedTier)]);
 
 		} break;
 		case Stop://停止
@@ -237,7 +268,7 @@ void motorControl(void) {
 			}
 			_setMotorCurrent(CURRENT_NORMAL_MA);      // steady current
 			driver.shaft(BACK);
-			driver.VACTUAL(VACTUAL_NORMAL);
+			driver.VACTUAL(speed::vTable[static_cast<uint8_t>(currentSpeedTier)]);
 		} break;
 	}
 }
