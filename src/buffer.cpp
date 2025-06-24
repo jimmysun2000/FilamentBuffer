@@ -1,394 +1,297 @@
-#include "buffer.h"
+#include "buffer.hpp"
 
-Adafruit_MCP23X17 _io;
-TMC2209Stepper driver(UART, UART, R_SENSE, DRIVER_ADDRESS);
-HardwareTimer      _errorTimer{TIM6};
-SpeedTier currentSpeedTier{SpeedTier::Medium};
-static bool _lastInc{true}, _lastDec{true};
+/* static instance */
+Buffer buffer;
 
-static BufferState   _buf{};
-static Motor_State   _motorState{Stop};
-static Motor_State   _lastMotorState{Stop};
-static bool          _isFront{false};
-static bool          _isError{false};
-static uint32_t      _frontTime{0};
-static uint32_t      _timeout{60000};
-static uint16_t      _currentCached{CURRENT_NORMAL_MA};
-static String        _serialBuffer;
-static uint32_t 	 _lastBlink;
-inline void _writeLed(uint8_t pin, bool level)       { _io.digitalWrite(pin, level); }
-inline void _toggleLed(uint8_t pin)                  { _io.digitalWrite(pin, !_io.digitalRead(pin)); }
-inline bool _readKey(uint8_t pin)                    { return _io.digitalRead(pin); }
-static bool        _manualOverride{true};
-static bool        _moveActive{false};
-static Motor_State _moveDir{Stop};
-static uint32_t    _moveStopMillis{0};
-static bool _lastOverride{true}, _lastCancel{true}, _lastFwd{true}, _lastRev{true};
+/* ─────────────────────────── PUBLIC ────────────────────────── */
+void Buffer::begin()
+{
+    Serial.begin(115200);
+    Serial.dtr(false);
 
-static inline void _setMotorCurrent(uint16_t mA) {
-    if (mA != _currentCached) {
-        driver.rms_current(mA);
-        _currentCached = mA;
-	}
+    Wire.begin();
+    _initIo();
+
+    pinMode(kHall1, INPUT);
+    pinMode(kHall2, INPUT);
+    pinMode(kHall3, INPUT);
+    pinMode(kEndstop, INPUT);
+
+    pinMode(kEnPin, OUTPUT);
+    pinMode(kDirPin, OUTPUT);
+    pinMode(kStepPin, OUTPUT);
+    digitalWrite(kEnPin, LOW);
+
+    _driver.beginSerial(9600);
+    _driver.I_scale_analog(false);
+    _driver.toff(5);
+    _driver.rms_current(kCurrentIdle);
+    _driver.microsteps(kMicroSteps);
+    _driver.VACTUAL(0);
+    _driver.en_spreadCycle(true);
+    _driver.pwm_autoscale(true);
+
+    EEPROM.get(0, _timeout);
+    if (_timeout == 0 || _timeout == 0xFFFFFFFF) {
+        _timeout = 30000;
+        EEPROM.put(0, _timeout);
+    }
+
+    /* 1 kHz watchdog */
+    _timer.pause();
+    _timer.setPrescaleFactor(48);
+    _timer.setOverflow(1000);
+    _timer.attachInterrupt(Buffer::_isrThunk);
+    _timer.resume();
+
+    _blinkTimer = millis();
 }
 
-static bool _lastRst{true};          // active-low → start HIGH
+void Buffer::update()
+{
+    if (millis() - _blinkTimer >= 500) {
+        _blinkTimer += 500;
+        _toggleLed(McpPin::ledStatus);
+    }
 
-void _pollRstButton() {
-    bool now = _readKey(swRstPin);   // LOW when pressed
+    _pollRstButton();
+    _updateOverrideAndCancel();
+    _updateSpeedTier();
+    _showSpeedTier();
+    _processDirectionKeys();
+    _runOneClickJob();
 
-    if (!now && _lastRst) {          // 0→1 edge (= key press)
-        /* debounce delay, optional */
+    /* sample sensors */
+    _s.hall1           = digitalRead(kHall3);
+    _s.hall2           = digitalRead(kHall2);
+    _s.hall3           = digitalRead(kHall1);
+    _s.materialPresent = !digitalRead(kEndstop);
+    _s.keyRev          = !_readKey(McpPin::swReverse);
+    _s.keyFwd          = !_readKey(McpPin::swForward);
+
+    _motorControl();
+}
+
+void Buffer::timerIsr()                   // called from thunk
+{
+    if (_isFront && ++_frontMs > _timeout) {
+        _isError = true;
+        _writeLed(McpPin::ledError, true);
+    }
+}
+
+/* ─────────────────────────── PRIVATE ───────────────────────── */
+
+void Buffer::_initIo()
+{
+    _io.begin_I2C(kMcpAddr);
+
+    for (uint8_t p : {0,1,2,3,4,5,6})                 // GPA0-6 inputs
+        _io.pinMode(p, INPUT_PULLUP);
+
+    for (uint8_t p : {8,9,10,11,12,13,14,15,7}) {     // all outputs
+        _io.pinMode(p, OUTPUT);
+        _io.digitalWrite(p, HIGH);
+    }
+    _writeLed(McpPin::ledOverride, true);             // manual on boot
+}
+
+void Buffer::_writeLed(McpPin pin, bool lowActive)
+{
+    _io.digitalWrite(static_cast<uint8_t>(pin), lowActive ? LOW : HIGH);
+}
+void Buffer::_toggleLed(McpPin pin)
+{
+    uint8_t p = static_cast<uint8_t>(pin);
+    _io.digitalWrite(p, !_io.digitalRead(p));
+}
+bool Buffer::_readKey(McpPin pin)
+{
+    return _io.digitalRead(static_cast<uint8_t>(pin));
+}
+
+/* ───── reset key ───── */
+void Buffer::_pollRstButton()
+{
+    bool now = _readKey(McpPin::swRst);
+    if (!now && _lastRst) {
         delay(5);
-        if (!_readKey(swRstPin)) {
-            /* illuminate Override-LED for user feedback */
-            _writeLed(ledOverridePin, LOW);
+        if (!_readKey(McpPin::swRst)) {
+            _writeLed(McpPin::ledOverride, true);
             delay(50);
-            NVIC_SystemReset();      // never returns
+            NVIC_SystemReset();
         }
     }
     _lastRst = now;
 }
 
-static void _updateOverrideAndCancel() {
-    bool ovNow  = _readKey(swOverridePin);
-    bool cnNow  = _readKey(swCancelPin);
+/* ───── override / cancel ───── */
+void Buffer::_updateOverrideAndCancel()
+{
+    bool ov = _readKey(McpPin::swOverride);
+    bool cn = _readKey(McpPin::swCancel);
 
-    /* override toggle on rising edge */
-    if (!ovNow && _lastOverride) {
+    if (!ov && _lastOv) {
         _manualOverride = !_manualOverride;
-        _writeLed(ledOverridePin, _manualOverride ? LOW : HIGH);
-        /* kill any running one-click job when entering manual */
-        if (_manualOverride && _moveActive) _moveActive = false;
+        _writeLed(McpPin::ledOverride, _manualOverride);
+        if (_manualOverride) _moveActive = false;
     }
-    _lastOverride = ovNow;
+    _lastOv = ov;
 
-    /* cancel key: stop immediately */
-    if (!cnNow && _lastCancel) {
-        if (_moveActive) _moveActive = false;
-        driver.VACTUAL(STOP);
-        WRITE_EN_PIN(1);
+    if (!cn && _lastCn) {
+        _moveActive = false;
+        _driver.VACTUAL(0);
+        digitalWrite(kEnPin, HIGH);
     }
-    _lastCancel = cnNow;
+    _lastCn = cn;
 }
 
-static void _processDirectionKeys() {
-    bool fwd = _readKey(swForwardPin);
-    bool rev = _readKey(swReversePin);
+/* ───── speed ladder ───── */
+void Buffer::_updateSpeedTier()
+{
+    bool inc = _readKey(McpPin::swSpeedInc);
+    bool dec = _readKey(McpPin::swSpeedDec);
 
-    /* ───── manual: jog while held ───── */
-    if (_manualOverride) {
+    if (!inc && _lastInc)
+        _speedTier = static_cast<SpeedTier>((uint8_t(_speedTier)+1) %
+                                            uint8_t(SpeedTier::Count));
+    if (!dec && _lastDec)
+        _speedTier = static_cast<SpeedTier>((uint8_t(_speedTier)+2) %
+                                            uint8_t(SpeedTier::Count));
+
+    _lastInc = inc;  _lastDec = dec;
+}
+void Buffer::_showSpeedTier()
+{
+    _writeLed(McpPin::ledSpeedLow,    _speedTier == SpeedTier::Low);
+    _writeLed(McpPin::ledSpeedMedium, _speedTier == SpeedTier::Medium);
+    _writeLed(McpPin::ledSpeedHigh,   _speedTier == SpeedTier::High);
+}
+
+/* ───── direction keys ───── */
+void Buffer::_processDirectionKeys()
+{
+    bool fwd = _readKey(McpPin::swForward);
+    bool rev = _readKey(McpPin::swReverse);
+
+    if (_manualOverride) {                          /* jog mode */
         if (!fwd) {
-            _setMotorCurrent(CURRENT_BUTTON_MA);
-            _moveActive = false;
-            driver.shaft(FORWARD);
-            driver.VACTUAL(speed::vTable[uint8_t(currentSpeedTier)]);
-            WRITE_EN_PIN(0);
+            _setMotorCurrent(kCurrentBoost);
+            _driver.shaft(1);                       // forward
+            _driver.VACTUAL(speed::vTable[uint8_t(_speedTier)]);
+            digitalWrite(kEnPin, LOW);
         } else if (!rev) {
-            _setMotorCurrent(CURRENT_BUTTON_MA);
-            _moveActive = false;
-            driver.shaft(BACK);
-            driver.VACTUAL(speed::vTable[uint8_t(currentSpeedTier)]);
-            WRITE_EN_PIN(0);
+            _setMotorCurrent(kCurrentBoost);
+            _driver.shaft(0);                       // back
+            _driver.VACTUAL(speed::vTable[uint8_t(_speedTier)]);
+            digitalWrite(kEnPin, LOW);
         } else {
-            /* no key held – stop */
-            driver.VACTUAL(STOP);
-            WRITE_EN_PIN(1);
+            _driver.VACTUAL(0);
+            digitalWrite(kEnPin, HIGH);
         }
-        _lastFwd = fwd;
-        _lastRev = rev;
+        _lastFwd = fwd; _lastRev = rev;
         return;
     }
 
-    /* ───── normal: one-click move job ───── */
-    /* rising edge triggers a new move if none running */
+    /* one-click mode */
     if (!_moveActive && !fwd && _lastFwd) {
-        _moveDir         = Forward;
-        _moveActive      = true;
-        _moveStopMillis  = millis() +
-            _timeForDistance(kLoadDistanceMm, speed::rpmMed);             // use MED rpm for timing
+        _moveDir     = MotorState::Forward;
+        _moveActive  = true;
+        _moveStopMs  = millis()+_timeForDistance(kLoadMm, speed::rpmMed);
     } else if (!_moveActive && !rev && _lastRev) {
-        _moveDir         = Back;
-        _moveActive      = true;
-        _moveStopMillis  = millis() +
-            _timeForDistance(kLoadDistanceMm, speed::rpmMed);
+        _moveDir     = MotorState::Back;
+        _moveActive  = true;
+        _moveStopMs  = millis()+_timeForDistance(kLoadMm, speed::rpmMed);
     }
-    _lastFwd = fwd;
-    _lastRev = rev;
+    _lastFwd = fwd; _lastRev = rev;
 }
 
-static void _runOneClickJob() {
+/* ───── drive timed job ───── */
+void Buffer::_runOneClickJob()
+{
     if (!_moveActive) return;
 
-    if (millis() >= _moveStopMillis) {
-        /* finished */
-        driver.VACTUAL(STOP);
-        WRITE_EN_PIN(1);
+    if (millis() >= _moveStopMs) {
+        _driver.VACTUAL(0);
+        digitalWrite(kEnPin, HIGH);
         _moveActive = false;
         return;
     }
-
-    /* ensure the motor is running in the correct direction */
-    driver.shaft(_moveDir == Forward ? FORWARD : BACK);
-    driver.VACTUAL(speed::vTable[uint8_t(currentSpeedTier)]);
-    WRITE_EN_PIN(0);
+    _driver.shaft(_moveDir == MotorState::Forward ? 1 : 0);
+    _driver.VACTUAL(speed::vTable[uint8_t(_speedTier)]);
+    digitalWrite(kEnPin, LOW);
 }
 
-static void _updateSpeedTier() {
-    /* active-low buttons */
-    bool inc = _readKey(swSpeedIncPin);
-    bool dec = _readKey(swSpeedDecPin);
-
-    /* rising-edge on either key? */
-    if (!inc && _lastInc) {
-        currentSpeedTier = static_cast<SpeedTier>(
-            (static_cast<uint8_t>(currentSpeedTier) + 1) %
-            static_cast<uint8_t>(SpeedTier::Count));
+/* ───── motor state-machine (hall sensors etc.) ───── */
+void Buffer::_motorControl()
+{
+    /* run-out */
+    if (!_s.materialPresent) {
+        _driver.VACTUAL(0);
+        digitalWrite(kEnPin, HIGH);
+        _writeLed(McpPin::ledFilament, true);
+        _writeLed(McpPin::ledForward,  false);
+        _writeLed(McpPin::ledReverse,  false);
+        _isFront = _isError = false; _frontMs = 0;
+        _motorState = MotorState::Stop;
+        return;
     }
-    if (!dec && _lastDec) {
-        currentSpeedTier = static_cast<SpeedTier>(
-            (static_cast<uint8_t>(currentSpeedTier) + 2) %
-            static_cast<uint8_t>(SpeedTier::Count));    // -1 mod 3
-    }
-    _lastInc = inc;
-    _lastDec = dec;
-}
+    _writeLed(McpPin::ledFilament, false);
 
-/* refresh the three indicator LEDs */
-static void _showSpeedTier() {
-    _writeLed(ledSpeedLowPin,    currentSpeedTier == SpeedTier::Low    ? LOW : HIGH);
-    _writeLed(ledSpeedMediumPin, currentSpeedTier == SpeedTier::Medium ? LOW : HIGH);
-    _writeLed(ledSpeedHighPin,   currentSpeedTier == SpeedTier::High   ? LOW : HIGH);
-}
-
-static void _initIoExpander() {
-    _io.begin_I2C(MCP_ADDR);
-
-    /* inputs with pull-ups */
-    for (uint8_t p : {swOverridePin, swCancelPin, swSpeedIncPin,
-                      swRstPin, swForwardPin, swReversePin, swSpeedDecPin}) {
-        _io.pinMode(p, INPUT_PULLUP);
-    }
-
-    /* outputs – default off (HIGH) */
-    for (uint8_t p : {ledOverridePin, ledSpeedLowPin, ledFilamentPin, ledStatusPin,
-                      ledErrorPin, ledReversePin, ledSpeedMediumPin,
-                      ledSpeedHighPin, ledForwardPin}) {
-        _io.pinMode(p, OUTPUT);
-        _io.digitalWrite(p, HIGH);
-    }
-	_writeLed(ledOverridePin, LOW);
-}
-
-void bufferInit() {
-    Wire.begin();
-    _initIoExpander();
-
-    /* local sensors */
-    pinMode(HALL1, INPUT);
-    pinMode(HALL2, INPUT);
-    pinMode(HALL3, INPUT);
-    pinMode(ENDSTOP_3, INPUT);
-
-    /* stepper outputs */
-    pinMode(EN_PIN,  OUTPUT);
-    pinMode(DIR_PIN, OUTPUT);
-    pinMode(STEP_PIN,OUTPUT);
-    digitalWrite(EN_PIN, LOW);
-    driver.beginSerial(9600);
-    driver.I_scale_analog(false);
-    driver.toff(5);
-    driver.rms_current(CURRENT_NORMAL_MA);
-    driver.microsteps(Move_Divide_NUM);
-	driver.VACTUAL(STOP);
-    driver.en_spreadCycle(true);
-    driver.pwm_autoscale(true);
-
-	delay(1000);
-
-    /* read timeout from EEPROM */
-    EEPROM.get(0, _timeout);
-    if (_timeout == 0 || _timeout == 0xFFFFFFFF) {
-        _timeout = 30000;
-        EEPROM.put(0, _timeout);
-		Serial.println("EEPROM is empty");
-	} else {
-		Serial.print("read timeout: ");
-		Serial.println(_timeout);
-	}
-
-    /* 1 kHz timer for error watchdog */
-    _errorTimer.pause();
-    _errorTimer.setPrescaleFactor(48);
-    _errorTimer.setOverflow(1000);
-    _errorTimer.attachInterrupt(_timerInterruptHandler);
-    _errorTimer.resume();
-
-    _lastBlink = millis();
-}
-
-void bufferLoop() {
-	/* heartbeat every 500 ms */
-	if (millis() - _lastBlink >= 500) {
-		_lastBlink = millis();
-		_toggleLed(ledStatusPin);
-	}
-
-	_pollRstButton();
-	_updateOverrideAndCancel();
-	_processDirectionKeys();
-	_runOneClickJob();
-
-	/* poll speed keys & set speed leds */
-	_updateSpeedTier();
-	_showSpeedTier();
-
-	_buf.hallPos1        = digitalRead(HALL3);
-	_buf.hallPos2        = digitalRead(HALL2);
-	_buf.hallPos3        = digitalRead(HALL1);
-	_buf.materialPresent = !digitalRead(ENDSTOP_3);
-	_buf.keyReverse      = !_readKey(swReversePin);
-	_buf.keyForward      = !_readKey(swForwardPin);
-
-	motorControl();
-}
-
-void motorControl(void) {
-    /* Reverse button */
-    if (_buf.keyReverse) {
-        _writeLed(ledForwardPin, HIGH);
-        _writeLed(ledReversePin, LOW);
-		WRITE_EN_PIN(0); 		// Enable stepper
-		driver.VACTUAL(STOP);	// Stop
-		_setMotorCurrent(CURRENT_BUTTON_MA);      // boost current
-
-		driver.shaft(BACK);
-		driver.VACTUAL(speed::vTable[static_cast<uint8_t>(currentSpeedTier)]);
-		while(_buf.keyReverse); // Wait for button to be released
-					
-		driver.VACTUAL(STOP);	// Stop
-		_motorState = Stop;
-
-		_isFront = false;
-		_frontTime = 0;
-		_isError = false;
-		WRITE_EN_PIN(1); 		// Disable stepper
-        _writeLed(ledReversePin, HIGH);
-	}
-    /* Forward button */
-    else if (_buf.keyForward) {
-        _writeLed(ledForwardPin, LOW);
-        _writeLed(ledReversePin, HIGH);
-		WRITE_EN_PIN(0);
-		driver.VACTUAL(STOP);
-		_setMotorCurrent(CURRENT_BUTTON_MA);      // boost current
-
-    	driver.shaft(FORWARD);
-		driver.VACTUAL(speed::vTable[static_cast<uint8_t>(currentSpeedTier)]);
-		while(_buf.keyForward);
-					
-		driver.VACTUAL(STOP);
-		_motorState = Stop;
-
-		_isFront = false;
-		_frontTime = 0;
-		_isError = false;
-		WRITE_EN_PIN(1);
-        _writeLed(ledForwardPin, HIGH);
-	}
-    /* material run-out */
-    if (!_buf.materialPresent) {
-		// Filament run out, stop stepper
-		driver.VACTUAL(STOP);
-		_motorState = Stop;
-		_isFront = false;
-		_frontTime = 0;
-		_isError = false;
-		WRITE_EN_PIN(1);
-
-		_writeLed(ledFilamentPin, HIGH);
-        _writeLed(ledForwardPin, HIGH);
-        _writeLed(ledReversePin, HIGH);
+    if (_isError) {                                 // latched error
+        _driver.VACTUAL(0);
+        digitalWrite(kEnPin, HIGH);
+        _writeLed(McpPin::ledError, true);
         return;
     }
 
-	_writeLed(ledFilamentPin, LOW);
+    /* hall logic */
+    if (_s.hall1)       { _motorState = MotorState::Forward; _isFront = true; }
+    else if (_s.hall2)  { _motorState = MotorState::Stop;    _isFront = false; _frontMs = 0; }
+    else if (_s.hall3)  { _motorState = MotorState::Back;    _isFront = false; _frontMs = 0; }
 
-    /* error state */
-    if (_isError) {
-        _writeLed(ledErrorPin, LOW);
-		driver.VACTUAL(STOP);
-		_motorState = Stop;
-		WRITE_EN_PIN(1);
-        _writeLed(ledForwardPin, HIGH);
-        _writeLed(ledReversePin, HIGH);     
-		return;
-    }
+    if (_motorState == _lastMotorState) return;
+    _lastMotorState = _motorState;
 
-	// Buffer location detection
-	if (_buf.hallPos1) {	//缓冲器位置为1，耗材往前推
-		_lastMotorState = _motorState;		//记录上一次状态
-		_motorState = Forward;
-		_isFront = true;
-	}
-	else if (_buf.hallPos2) {	//缓冲器位置为2,电机停止转动
-		_lastMotorState = _motorState;		//记录上一次状态
-		_motorState = Stop;
-		_isFront = false;
-		_frontTime = 0;
-	}
-	else if(_buf.hallPos3) {	//缓冲器位置为3，回退耗材
-		_lastMotorState = _motorState;		//记录上一次状态
-		_motorState = Back;
-		_isFront = false;
-		_frontTime = 0;
-	}
-			
-	if (_motorState == _lastMotorState) { //如果上次状态跟这次状态一致，则不需要再次发送控制命令,结束此次函数
-		return;
-	}
-
-	//电机控制
-	switch(_motorState) {
-		case Forward://向前
-		{
-        	_writeLed(ledErrorPin, HIGH);
-        	_writeLed(ledForwardPin, LOW);
-			WRITE_EN_PIN(0);
-			if (_lastMotorState == Back) {
-				driver.VACTUAL(STOP);//上次是后退，先停下再前进
-			}
-			_setMotorCurrent(CURRENT_NORMAL_MA);      // steady current
-			driver.shaft(FORWARD);
-			driver.VACTUAL(speed::vTable[static_cast<uint8_t>(currentSpeedTier)]);
-
-		} break;
-		case Stop://停止
-		{
-        	_writeLed(ledForwardPin, HIGH);
-        	_writeLed(ledReversePin, HIGH);
-			WRITE_EN_PIN(1);
-			driver.VACTUAL(STOP);
-
-		} break;
-		case Back://向后
-		{
-        	_writeLed(ledErrorPin, HIGH);
-        	_writeLed(ledReversePin, LOW);
-			WRITE_EN_PIN(0);
-			if (_lastMotorState == Forward) {
-				driver.VACTUAL(STOP);//上次是前进，先停下再后退
-			}
-			_setMotorCurrent(CURRENT_NORMAL_MA);      // steady current
-			driver.shaft(BACK);
-			driver.VACTUAL(speed::vTable[static_cast<uint8_t>(currentSpeedTier)]);
-		} break;
-	}
-}
-
-void _timerInterruptHandler() {
-    if (_isFront && ++_frontTime > _timeout) {
-        _isError = true;
-        _writeLed(ledErrorPin, LOW);
+    switch (_motorState) {
+    case MotorState::Forward:
+        _writeLed(McpPin::ledForward, true);
+        _writeLed(McpPin::ledReverse, false);
+        digitalWrite(kEnPin, LOW);
+        _setMotorCurrent(kCurrentIdle);
+        _driver.shaft(1);
+        _driver.VACTUAL(speed::vTable[uint8_t(_speedTier)]);
+        break;
+    case MotorState::Back:
+        _writeLed(McpPin::ledForward, false);
+        _writeLed(McpPin::ledReverse, true);
+        digitalWrite(kEnPin, LOW);
+        _setMotorCurrent(kCurrentIdle);
+        _driver.shaft(0);
+        _driver.VACTUAL(speed::vTable[uint8_t(_speedTier)]);
+        break;
+    case MotorState::Stop:
+        _writeLed(McpPin::ledForward, false);
+        _writeLed(McpPin::ledReverse, false);
+        _driver.VACTUAL(0);
+        digitalWrite(kEnPin, HIGH);
+        break;
     }
 }
+
+void Buffer::_setMotorCurrent(uint16_t mA)
+{
+    if (mA == _cachedCurrent) return;
+    _driver.rms_current(mA);
+    _cachedCurrent = mA;
+}
+
+uint32_t Buffer::_timeForDistance(float mm, uint32_t rpm)
+{
+    float rev  = mm / kMmPerRev;
+    float sec  = rev / (rpm / 60.0f);
+    return uint32_t(sec * 1000.0f + 0.5f);
+}
+
+/* ───── static ISR trampoline ───── */
+void Buffer::_isrThunk() { buffer.timerIsr(); }
