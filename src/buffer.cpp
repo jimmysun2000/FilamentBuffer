@@ -1,296 +1,217 @@
 #include "buffer.h"
+
+Adafruit_MCP23X17 _io;
 TMC2209Stepper driver(UART, UART, R_SENSE, DRIVER_ADDRESS);
-Buffer buffer = {0}; 					// Input sensor states
-Motor_State motor_state = Stop;
+HardwareTimer      _errorTimer{TIM6};
 
-bool is_front = false; 					// Filament is pushed to the front
-uint32_t front_time = 0; 				// Filament time in front position
-const int EEPROM_ADDR_TIMEOUT = 0;
-const uint32_t DEFAULT_TIMEOUT = 30000;
-uint32_t timeout = 60000; 				// timeout in ms
-bool is_error = false;					// error state
-String serial_buf;
-static uint16_t _currentCached = CURRENT_NORMAL_MA;
+static BufferState   _buf{};
+static Motor_State   _motorState{Stop};
+static Motor_State   _lastMotorState{Stop};
+static bool          _isFront{false};
+static bool          _isError{false};
+static uint32_t      _frontTime{0};
+static uint32_t      _timeout{60000};
+static uint16_t      _currentCached{CURRENT_NORMAL_MA};
+static String        _serialBuffer;
 
-static HardwareTimer timer(TIM6);		// Error timer
+inline void _writeLed(uint8_t pin, bool level)       { _io.digitalWrite(pin, level); }
+inline void _toggleLed(uint8_t pin)                  { _io.digitalWrite(pin, !_io.digitalRead(pin)); }
+inline bool _readKey(uint8_t pin)                    { return _io.digitalRead(pin); }
 
-void buffer_init() {
-	buffer_sensor_init();
-	buffer_motor_init();
-	delay(1000);
+static void _initIoExpander() {
+    _io.begin_I2C(MCP_ADDR);
 
-	EEPROM.get(EEPROM_ADDR_TIMEOUT, timeout);
-	// 判断读取的值是否有效（例如首次写入前是 0xFFFFFFFF 或 0）
-	if (timeout == 0xFFFFFFFF || timeout == 0) {
-		timeout = DEFAULT_TIMEOUT;
-		EEPROM.put(EEPROM_ADDR_TIMEOUT, timeout);
-		Serial.println("EEPROM is empty");
-	} else {
-		Serial.print("read timeout: ");
-		Serial.println(timeout);
-	}
+    /* inputs with pull-ups */
+    for (uint8_t p : {swOverridePin, swCancelPin, swSpeedIncPin,
+                      swRstPin, swForwardPin, swReversePin, swSpeedDecPin}) {
+        _io.pinMode(p, INPUT_PULLUP);
+    }
 
-	timer.pause();
-	timer.setPrescaleFactor(48); //48分频  48000000/48=1000000
-	timer.setOverflow(1000); //1ms
-	timer.attachInterrupt(&timer_it_callback);
-	timer.resume();
-}
-
-void buffer_loop() {
-	uint32_t lastToggleTime = millis();
-	while (1) {
-		// every 500ms
-		if(millis() - lastToggleTime >= 500) {
-			lastToggleTime = millis();
-			digitalToggle(STATUS_LED);
-		}
-
-		// Read sensors
-		read_sensor_state();
-
-#if DEBUG
-		buffer_debug();
-		while (Serial.available() > 0) {
-		char c = Serial.read();
-		serial_buf += c;
-		int pos_enter = -1;
-		pos_enter = serial_buf.indexOf("\n");
-		if (pos_enter != -1) {
-			String str = serial_buf.substring(0, pos_enter);
-			serial_buf = serial_buf.substring(pos_enter + 1);
-			if (strstr(str.c_str(), "gconf") != NULL){
-				TMC2208_n::CHOPCONF_t gconf{0};
-
-				// 提取 "gconf" 后面的十六进制字符串
-				int pos = str.indexOf("gconf");
-				if (pos != -1) {
-					String hexPart = str.substring(pos + 5); // 跳过 "gconf"
-					hexPart.trim(); // 去除前后空白符
-
-					// 将字符串转换为 32 位无符号整数
-					uint32_t hexValue = strtoul(hexPart.c_str(), NULL, 16);
-
-					// 赋值给结构体（按你的结构定义赋值）
-					gconf.sr = hexValue; // 假设 sr 是结构体中的原始寄存器值字段
-				}
-				driver.GCONF(gconf.sr);
-				Serial.print("write GCONF:0x");
-				Serial.println(gconf.sr, HEX);
-				Serial.print("read GCONF: 0x");	
-				Serial.println(driver.GCONF(), HEX);
-			}
-		}
-	}
-
-#else 
-		motor_control();
-
-		while (Serial.available() > 0) {
-			char c = Serial.read();
-			serial_buf += c;
-		}
-
-		if (serial_buf.length() > 0) {
-			if (serial_buf == "rt") {
-				Serial.print("read timeout=");
-				Serial.println(timeout);
-				serial_buf = "";
-			}
-			else if (serial_buf.startsWith("set")) {
-				serial_buf.remove(0,3);
-				int64_t num = serial_buf.toInt();
-				if (num < 0 || num > 0xffffffff) {
-					serial_buf = "";
-					Serial.println("Error: Invalid timeout value.");
-					continue;
-				}
-				timeout = num;
-				EEPROM.put(EEPROM_ADDR_TIMEOUT, timeout);
-				serial_buf = "";
-				Serial.print("set succeed! timeout=");
-				Serial.println(timeout);
-			}
-			else {
-				Serial.println(serial_buf.c_str());
-				Serial.println("command error!");
-				serial_buf = "";
-			}    
-		}
-#endif
-	}
-}
-
-void buffer_sensor_init() {
-	// Initialise sensors
-	pinMode(HALL1, INPUT);
-	pinMode(HALL2, INPUT);
-	pinMode(HALL3, INPUT);
-	pinMode(ENDSTOP_3, INPUT);
-	pinMode(KEY_REVERSE, INPUT_PULLUP);
-	pinMode(KEY_FORWARD, INPUT_PULLUP);
-	pinMode(KEY_REVERSE2, INPUT_PULLUP);
-	pinMode(KEY_FORWARD2, INPUT_PULLUP);
-
-	// Initialise LEDs
-	pinMode(FILAMENT_OUTPUT, OUTPUT);
-	pinMode(ERR_LED, OUTPUT);
-	pinMode(STATUS_LED, OUTPUT);
-	pinMode(LED_REVERSE, OUTPUT);
-	pinMode(LED_FORWARD, OUTPUT);
-
-	digitalWrite(FILAMENT_OUTPUT, HIGH);
-	digitalWrite(ERR_LED, HIGH);
-	digitalWrite(STATUS_LED, HIGH);
-	digitalWrite(LED_REVERSE, HIGH);
-	digitalWrite(LED_FORWARD, HIGH);
-}
-
-void buffer_motor_init() {
-	// Initialise stepper
-	pinMode(EN_PIN, OUTPUT);
-	pinMode(STEP_PIN, OUTPUT);
-	pinMode(DIR_PIN, OUTPUT);
-	digitalWrite(EN_PIN, LOW);      	// Enable driver in hardware
-	// driver.begin();                  	// UART: Init SW UART (if selected) with default 115200 baudrate
-	driver.beginSerial(9600);
-	driver.I_scale_analog(false);
-	driver.toff(5);                 	// Enables driver in software
-	driver.rms_current(CURRENT_NORMAL_MA);
-	driver.microsteps(Move_Divide_NUM); // Set microsteps to 1/16th
-	driver.VACTUAL(STOP);           	// Set velocity
-	driver.en_spreadCycle(true);
-	driver.pwm_autoscale(true);
-}
-
-void read_sensor_state(void) {
-	buffer.buffer1_pos1_sensor_state = digitalRead(HALL3);
-	buffer.buffer1_pos2_sensor_state = digitalRead(HALL2);	
-	buffer.buffer1_pos3_sensor_state = digitalRead(HALL1);		
-	buffer.buffer1_material_swtich_state = digitalRead(ENDSTOP_3);	
-	buffer.key_reverse = digitalRead(KEY_REVERSE) & digitalRead(KEY_REVERSE2);
-	buffer.key_forward = digitalRead(KEY_FORWARD) & digitalRead(KEY_FORWARD2);
-}
-
-static inline void _setMotorCurrent(uint16_t mA)
-{
-    if (mA != _currentCached) {
-        driver.rms_current(mA);
-        _currentCached = mA;
+    /* outputs – default off (HIGH) */
+    for (uint8_t p : {ledOverridePin, ledSpeedLowPin, ledFilamentPin, ledStatusPin,
+                      ledErrorPin, ledReversePin, ledSpeedMediumPin,
+                      ledSpeedHighPin, ledForwardPin}) {
+        _io.pinMode(p, OUTPUT);
+        _io.digitalWrite(p, HIGH);
     }
 }
 
-void motor_control(void) {
-	static Motor_State last_motor_state = Stop;
-	
-	// Control stepper using buttons
-	// Reverse key pressed
-	if (!digitalRead(KEY_REVERSE) | !digitalRead(KEY_REVERSE2)) {
-		digitalWrite(LED_FORWARD, 1);
-		digitalWrite(LED_REVERSE, 0);
+void bufferInit() {
+    Wire.begin();
+    _initIoExpander();
+
+    /* local sensors */
+    pinMode(HALL1, INPUT);
+    pinMode(HALL2, INPUT);
+    pinMode(HALL3, INPUT);
+    pinMode(ENDSTOP_3, INPUT);
+
+    /* stepper outputs */
+    pinMode(EN_PIN,  OUTPUT);
+    pinMode(DIR_PIN, OUTPUT);
+    pinMode(STEP_PIN,OUTPUT);
+    digitalWrite(EN_PIN, LOW);
+    driver.beginSerial(9600);
+    driver.I_scale_analog(false);
+    driver.toff(5);
+    driver.rms_current(CURRENT_NORMAL_MA);
+    driver.microsteps(Move_Divide_NUM);
+	driver.VACTUAL(STOP);
+    driver.en_spreadCycle(true);
+    driver.pwm_autoscale(true);
+
+	delay(1000);
+
+    /* read timeout from EEPROM */
+    EEPROM.get(0, _timeout);
+    if (_timeout == 0 || _timeout == 0xFFFFFFFF) {
+        _timeout = 30000;
+        EEPROM.put(0, _timeout);
+		Serial.println("EEPROM is empty");
+	} else {
+		Serial.print("read timeout: ");
+		Serial.println(_timeout);
+	}
+
+    /* 1 kHz timer for error watchdog */
+    _errorTimer.pause();
+    _errorTimer.setPrescaleFactor(48);
+    _errorTimer.setOverflow(1000);
+    _errorTimer.attachInterrupt(_timerInterruptHandler);
+    _errorTimer.resume();
+}
+
+static inline void _setMotorCurrent(uint16_t mA) {
+    if (mA != _currentCached) {
+        driver.rms_current(mA);
+        _currentCached = mA;
+	}
+}
+
+void bufferLoop() {
+    uint32_t lastBlink = millis();
+
+    for (;;) {
+        /* heartbeat every 500 ms */
+        if (millis() - lastBlink >= 500) {
+            lastBlink = millis();
+            _toggleLed(ledStatusPin);
+        }
+
+        _buf.hallPos1        = digitalRead(HALL3);
+        _buf.hallPos2        = digitalRead(HALL2);
+        _buf.hallPos3        = digitalRead(HALL1);
+        _buf.materialPresent = !digitalRead(ENDSTOP_3);   // active-low
+        _buf.keyReverse      = !_readKey(swReversePin);   // pressed = true
+        _buf.keyForward      = !_readKey(swForwardPin);
+
+        motorControl();
+    }
+}
+
+void motorControl(void) {
+    /* Reverse button */
+    if (_buf.keyReverse) {
+        _writeLed(ledForwardPin, HIGH);
+        _writeLed(ledReversePin, LOW);
 		WRITE_EN_PIN(0); 		// Enable stepper
 		driver.VACTUAL(STOP);	// Stop
 		_setMotorCurrent(CURRENT_BUTTON_MA);      // boost current
 
 		driver.shaft(BACK);
 		driver.VACTUAL(VACTUAL_BUTTON);
-		while(!digitalRead(KEY_REVERSE) | !digitalRead(KEY_REVERSE2)); // Wait for button to be released
+		while(_buf.keyReverse); // Wait for button to be released
 					
 		driver.VACTUAL(STOP);	// Stop
-		motor_state = Stop;
+		_motorState = Stop;
 
-		is_front = false;
-		front_time = 0;
-		is_error = false;
+		_isFront = false;
+		_frontTime = 0;
+		_isError = false;
 		WRITE_EN_PIN(1); 		// Disable stepper
-		digitalWrite(LED_REVERSE, 1);
+        _writeLed(ledReversePin, HIGH);
 	}
-
-	// Forward key pressed
-	else if (!digitalRead(KEY_FORWARD) | !digitalRead(KEY_FORWARD2)) {
-		digitalWrite(LED_FORWARD, 0);
-		digitalWrite(LED_REVERSE, 1);
+    /* Forward button */
+    else if (_buf.keyForward) {
+        _writeLed(ledForwardPin, LOW);
+        _writeLed(ledReversePin, HIGH);
 		WRITE_EN_PIN(0);
 		driver.VACTUAL(STOP);
 		_setMotorCurrent(CURRENT_BUTTON_MA);      // boost current
 
     	driver.shaft(FORWARD);
 		driver.VACTUAL(VACTUAL_BUTTON);
-		while(!digitalRead(KEY_FORWARD) | !digitalRead(KEY_FORWARD2));
+		while(_buf.keyForward);
 					
 		driver.VACTUAL(STOP);
-		motor_state = Stop;
+		_motorState = Stop;
 
-		is_front = false;
-		front_time = 0;
-		is_error = false;
+		_isFront = false;
+		_frontTime = 0;
+		_isError = false;
 		WRITE_EN_PIN(1);
-		digitalWrite(LED_FORWARD, 1);
+        _writeLed(ledForwardPin, HIGH);
 	}
-	
-	// Detect filament
-	if (digitalRead(ENDSTOP_3)) {
+    /* material run-out */
+    if (!_buf.materialPresent) {
 		// Filament run out, stop stepper
 		driver.VACTUAL(STOP);
-		motor_state = Stop;
-		
-		// Turn off signal for FILAMENT_OUTPUT
-		digitalWrite(FILAMENT_OUTPUT, 1);
-
-		is_front = false;
-		front_time = 0;
-		is_error = false;
+		_motorState = Stop;
+		_isFront = false;
+		_frontTime = 0;
+		_isError = false;
 		WRITE_EN_PIN(1);
-		digitalWrite(LED_FORWARD, 1);
-		digitalWrite(LED_REVERSE, 1);
-		return;
-	}
-		
-	// Filament detected, turn on LED
-	digitalWrite(FILAMENT_OUTPUT, 0);
 
-	// Stop stepper on error
-	if (is_error) {
+		_writeLed(ledFilamentPin, HIGH);
+        _writeLed(ledForwardPin, HIGH);
+        _writeLed(ledReversePin, HIGH);
+        return;
+    }
+
+	_writeLed(ledFilamentPin, LOW);
+
+    /* error state */
+    if (_isError) {
+        _writeLed(ledErrorPin, LOW);
 		driver.VACTUAL(STOP);
-		motor_state = Stop;
+		_motorState = Stop;
 		WRITE_EN_PIN(1);
-		digitalWrite(ERR_LED, 0);
-		digitalWrite(LED_FORWARD, 1);
-		digitalWrite(LED_REVERSE, 1);
+        _writeLed(ledForwardPin, HIGH);
+        _writeLed(ledReversePin, HIGH);     
 		return;
-	}
+    }
 
 	// Buffer location detection
-	if (buffer.buffer1_pos1_sensor_state) {	//缓冲器位置为1，耗材往前推
-		last_motor_state = motor_state;		//记录上一次状态
-		motor_state = Forward;
-		is_front = true;
+	if (_buf.hallPos1) {	//缓冲器位置为1，耗材往前推
+		_lastMotorState = _motorState;		//记录上一次状态
+		_motorState = Forward;
+		_isFront = true;
 	}
-	else if (buffer.buffer1_pos2_sensor_state) {	//缓冲器位置为2,电机停止转动
-		last_motor_state = motor_state;		//记录上一次状态
-		motor_state = Stop;
-		is_front = false;
-		front_time = 0;
+	else if (_buf.hallPos2) {	//缓冲器位置为2,电机停止转动
+		_lastMotorState = _motorState;		//记录上一次状态
+		_motorState = Stop;
+		_isFront = false;
+		_frontTime = 0;
 	}
-	else if(buffer.buffer1_pos3_sensor_state) {	//缓冲器位置为3，回退耗材
-		last_motor_state = motor_state;		//记录上一次状态
-		motor_state = Back;
-		is_front = false;
-		front_time = 0;
+	else if(_buf.hallPos3) {	//缓冲器位置为3，回退耗材
+		_lastMotorState = _motorState;		//记录上一次状态
+		_motorState = Back;
+		_isFront = false;
+		_frontTime = 0;
 	}
 			
-	if (motor_state==last_motor_state) { //如果上次状态跟这次状态一致，则不需要再次发送控制命令,结束此次函数
+	if (_motorState == _lastMotorState) { //如果上次状态跟这次状态一致，则不需要再次发送控制命令,结束此次函数
 		return;
 	}
 
 	//电机控制
-	switch(motor_state) {
+	switch(_motorState) {
 		case Forward://向前
 		{
-			digitalWrite(ERR_LED, 1);
-			digitalWrite(LED_FORWARD, 0);
+        	_writeLed(ledErrorPin, HIGH);
+        	_writeLed(ledForwardPin, LOW);
 			WRITE_EN_PIN(0);
-			if (last_motor_state == Back) {
+			if (_lastMotorState == Back) {
 				driver.VACTUAL(STOP);//上次是后退，先停下再前进
 			}
 			_setMotorCurrent(CURRENT_NORMAL_MA);      // steady current
@@ -300,18 +221,18 @@ void motor_control(void) {
 		} break;
 		case Stop://停止
 		{
-			digitalWrite(LED_FORWARD, 1);
-			digitalWrite(LED_REVERSE, 1);
+        	_writeLed(ledForwardPin, HIGH);
+        	_writeLed(ledReversePin, HIGH);
 			WRITE_EN_PIN(1);
 			driver.VACTUAL(STOP);
 
 		} break;
 		case Back://向后
 		{
-			digitalWrite(ERR_LED, 1);
-			digitalWrite(LED_REVERSE, 0);
+        	_writeLed(ledErrorPin, HIGH);
+        	_writeLed(ledReversePin, LOW);
 			WRITE_EN_PIN(0);
-			if (last_motor_state == Forward) {
+			if (_lastMotorState == Forward) {
 				driver.VACTUAL(STOP);//上次是前进，先停下再后退
 			}
 			_setMotorCurrent(CURRENT_NORMAL_MA);      // steady current
@@ -321,48 +242,9 @@ void motor_control(void) {
 	}
 }
 
-void timer_it_callback() {
-	if (is_front) {//如果往前推
-		front_time++;
-		if (front_time > timeout) {//如果超时
-			is_error = true;
-			digitalWrite(ERR_LED, 0);
-		}
-	}
-}
-
-void buffer_debug(void){
-	// Serial.print("buffer1_pos1_sensor_state:");Serial.println(buffer.buffer1_pos1_sensor_state);
-	// Serial.print("buffer1_pos2_sensor_state:");Serial.println(buffer.buffer1_pos2_sensor_state);
-	// Serial.print("buffer1_pos3_sensor_state:");Serial.println(buffer.buffer1_pos3_sensor_state);
-	// Serial.print("buffer1_material_swtich_state:");Serial.println(buffer.buffer1_material_swtich_state);
-	// Serial.print("key1:");Serial.println(buffer.key1);
-	// Serial.print("key2:");Serial.println(buffer.key2);
-	static int i = 0;
-	if (i < 0x1ff) {
-		Serial.print("i:");
-		Serial.println(i);
-		driver.GCONF(i);
-		driver.PWMCONF(i);
-		i++;
-	}
-	uint32_t gconf = driver.GCONF();
-	uint32_t chopconf = driver.CHOPCONF();
-	uint32_t pwmconf = driver.PWMCONF();
-	if (driver.CRCerror) {
-		Serial.println("CRCerror");
-	}
-	else {
-		Serial.print("GCONF():0x");
-		Serial.println(gconf, HEX);
-		Serial.print("CHOPCONF():0x");
-		char buf[11];  // "0x" + 8 digits + null terminator
-		sprintf(buf, "%08lX", chopconf);  // %08lX -> 8位大写十六进制（long unsigned）
-		Serial.println(buf);
-		Serial.print("PWMCONF():0x");
-		sprintf(buf, "%08lX", pwmconf);  // %08lX -> 8位大写十六进制（long unsigned）
-		Serial.println(buf);
-		Serial.println("");
-	}
-  	delay(1000);
+void _timerInterruptHandler() {
+    if (_isFront && ++_frontTime > _timeout) {
+        _isError = true;
+        _writeLed(ledErrorPin, LOW);
+    }
 }

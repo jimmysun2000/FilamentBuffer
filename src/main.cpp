@@ -4,11 +4,9 @@
 void setup() {
     Serial.begin(115200);
     Serial.dtr(false);
-    buffer_init();
-
+    bufferInit();
 }
 
 void loop() {
-    buffer_loop();
+    bufferLoop();
 }
-

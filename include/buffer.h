@@ -1,36 +1,60 @@
-#ifndef __BUFFER_H__
-#define __BUFFER_H__
+#ifndef BUFFER_HPP
+#define BUFFER_HPP
 
-#include <TMCStepper.h>
 #include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_MCP23X17.h>
+#include <TMCStepper.h>
 #include <EEPROM.h>
 
-#define HALL1       		PB2 		// Hall Sensor 3
-#define HALL2       		PB3 		// Hall Sensor 2   
-#define HALL3       		PB4 		// Hall Sensor 1
+/* =====  I²C port-expander wiring  =====
+ *
+ *            PORT-A (inputs except GPA7)         PORT-B (all outputs)
+ * ─────────────────────────────────────────────────────────────────────────
+ *  GPA0  SW_OVERRIDE               GPB0  LED_SPEED_LOW
+ *  GPA1  SW_CANCEL                 GPB1  LED_FILAMENT
+ *  GPA2  SW_SPEED_INC              GPB2  LED_STATUS
+ *  GPA3  SW_RST                    GPB3  LED_ERROR
+ *  GPA4  SW_FORWARD                GPB4  LED_REVERSE
+ *  GPA5  SW_REVERSE                GPB5  LED_SPEED_MEDIUM
+ *  GPA6  SW_SPEED_DEC              GPB6  LED_SPEED_HIGH
+ *  GPA7  LED_OVERRIDE              GPB7  LED_FORWARD
+ */
+constexpr uint8_t MCP_ADDR{0x20};
 
-#define ENDSTOP_3   		PB7 		// Filament Detection Sensor
+enum McpPin : uint8_t {
+    swOverridePin     = 0,
+    swCancelPin       = 1,
+    swSpeedIncPin     = 2,
+    swRstPin          = 3,
+    swForwardPin      = 4,
+    swReversePin      = 5,
+    swSpeedDecPin     = 6,
 
-#define KEY_REVERSE 		PB10 		// Reverse
-#define KEY_FORWARD 		PB11 		// Forward
+    ledOverridePin    = 7,
 
-#define KEY_REVERSE2 		PB13 		// Reverse
-#define KEY_FORWARD2 		PB12 		// Forward
+    ledSpeedLowPin    = 8,
+    ledFilamentPin    = 9,
+    ledStatusPin      = 10,
+    ledErrorPin       = 11,
+    ledReversePin     = 12,
+    ledSpeedMediumPin = 13,
+    ledSpeedHighPin   = 14,
+    ledForwardPin     = 15
+};
 
-#define LED_REVERSE 		PA4 		// Reverse
-#define LED_FORWARD 		PA5 		// Forward
+#define HALL1               PB2      // Hall Sensor 3
+#define HALL2               PB3      // Hall Sensor 2
+#define HALL3               PB4      // Hall Sensor 1
+#define ENDSTOP_3           PB7      // Filament Detect
 
-#define EN_PIN      		PA6 		// Stepper Enable
-#define DIR_PIN     		PA7 		// Stepper Direction
-#define STEP_PIN    		PC13 		// Stepper Step
-#define UART        		PB1 		// UART Port
+#define EN_PIN              PA6
+#define DIR_PIN             PA7
+#define STEP_PIN            PC13
+#define UART                PB1
 
-#define FILAMENT_OUTPUT  	PB15 		// Filament Detection Output
-#define ERR_LED     		PA3 		// Error LED
-#define STATUS_LED   		PA2  		// Status LED
-
-#define DRIVER_ADDRESS 		0b00 		// TMC Driver address according to MS1 and MS2
-#define R_SENSE 			0.11f 		// Match to your driver
+#define DRIVER_ADDRESS      0b00
+#define R_SENSE             0.11f
 
 #define SPEED_NORMAL_RPM    (uint32_t)(33/0.22)    // default buffer speed, capable of deliverying 33 mm^3/s (150 rpm) of filament
 // #define SPEED_NORMAL_RPM    (uint32_t)(66/0.22)    // default buffer speed, capable of deliverying 66 mm^3/s (300 rpm) of filament
@@ -50,14 +74,14 @@
 #define DEBUG 				0
 
 // Input states
-typedef struct Buffer {
-	bool buffer1_pos1_sensor_state;	
-	bool buffer1_pos2_sensor_state;		
-	bool buffer1_pos3_sensor_state;		
-	bool buffer1_material_swtich_state;	
-	bool key_reverse;
-	bool key_forward;
-} Buffer;
+struct BufferState {
+    bool hallPos1;
+    bool hallPos2;
+    bool hallPos3;
+    bool materialPresent;
+    bool keyReverse;
+    bool keyForward;
+};
 
 // Output stepper states
 typedef enum {
@@ -66,21 +90,10 @@ typedef enum {
 	Back			// Reverse
 } Motor_State;
 
-extern void buffer_sensor_init();
-extern void buffer_motor_init();
-
-extern void read_sensor_state(void);
-extern void motor_control(void);
-
-extern void buffer_init();
-extern void buffer_loop(void);
-extern void timer_it_callback();
-extern void buffer_debug(void);
-
-extern bool is_error;
-extern uint32_t front_time;	// Forward time
-extern uint32_t timeout;
-extern bool is_front;
-extern TMC2209Stepper driver;
+extern void motorControl(void);
+extern void bufferInit();
+extern void bufferLoop();
+extern void _timerInterruptHandler();
+extern void _bufferDebug();
 
 #endif
