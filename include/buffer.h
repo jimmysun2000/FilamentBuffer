@@ -1,86 +1,105 @@
-#ifndef __BUFFER_H__
-#define __BUFFER_H__
+#ifndef BUFFER_H
+#define BUFFER_H
 
-#include <TMCStepper.h>
 #include <Arduino.h>
 #include <EEPROM.h>
+#include <TMCStepper.h>
 
-#define HALL1       		PB2 		// Hall Sensor 3
-#define HALL2       		PB3 		// Hall Sensor 2   
-#define HALL3       		PB4 		// Hall Sensor 1
+constexpr bool useMcp = true;
+constexpr bool useMcpInMotorControl = true;
+constexpr bool debugEnabled = false;
 
-#define ENDSTOP_3   		PB7 		// Filament Detection Sensor
+// Original buffer pins
+constexpr uint8_t hall1Pin = PB2;
+constexpr uint8_t hall2Pin = PB3;
+constexpr uint8_t hall3Pin = PB4;
 
-#define KEY_REVERSE 		PB10 		// Reverse
-#define KEY_FORWARD 		PB11 		// Forward
+constexpr uint8_t endstop3Pin = PB7;
 
-#define KEY_REVERSE2 		PB13 		// Reverse
-#define KEY_FORWARD2 		PB12 		// Forward
+constexpr uint8_t keyReversePin = PB10;
+constexpr uint8_t keyForwardPin = PB11;
+constexpr uint8_t keyForward2Pin = PB12;
+constexpr uint8_t keyReverse2Pin = PB13;
 
-#define LED_REVERSE 		PA4 		// Reverse
-#define LED_FORWARD 		PA5 		// Forward
+constexpr uint8_t ledReversePin = PA4;
+constexpr uint8_t ledForwardPin = PA5;
 
-#define EN_PIN      		PA6 		// Stepper Enable
-#define DIR_PIN     		PA7 		// Stepper Direction
-#define STEP_PIN    		PC13 		// Stepper Step
-#define UART        		PB1 		// UART Port
+constexpr uint8_t enPin = PA6;
+constexpr uint8_t dirMotorPin = PA7;
+constexpr uint8_t stepPin = PC13;
+constexpr uint8_t uartPin = PB1;
 
-#define FILAMENT_OUTPUT  	PB15 		// Filament Detection Output
-#define ERR_LED     		PA3 		// Error LED
-#define STATUS_LED   		PA2  		// Status LED
+// MCP wiring on your board
+constexpr uint8_t mcpSclPin = PB14;
+constexpr uint8_t mcpSdaPin = PB15;
+constexpr uint8_t mcpIntPin = PA3;
+constexpr uint8_t muxResetPin = PA2;
 
-#define DRIVER_ADDRESS 		0b00 		// TMC Driver address according to MS1 and MS2
-#define R_SENSE 			0.11f 		// Match to your driver
+// TMC2209
+constexpr uint8_t driverAddress = 0b00;
+constexpr float rSense = 0.11f;
 
-#define SPEED_NORMAL_RPM    (uint32_t)(33/0.22)    // default buffer speed, capable of deliverying 33 mm^3/s (150 rpm) of filament
-// #define SPEED_NORMAL_RPM    (uint32_t)(66/0.22)    // default buffer speed, capable of deliverying 66 mm^3/s (300 rpm) of filament
-#define SPEED_BUTTON_RPM    (uint32_t)(66/0.22)    // speed while a key is held (66 mm^3/s)
-#define Move_Divide_NUM	((int32_t)(64))	// Micro Stepping
-#define VACTUAL_NORMAL  (uint32_t)(SPEED_NORMAL_RPM * Move_Divide_NUM * 200 / 60 / 0.715f)
-#define VACTUAL_BUTTON  (uint32_t)(SPEED_BUTTON_RPM * Move_Divide_NUM * 200 / 60 / 0.715f)
+// Motion settings
+constexpr uint32_t speedNormalRpm = static_cast<uint32_t>(33.0f / 0.22f);
+constexpr uint32_t speedButtonRpm = static_cast<uint32_t>(66.0f / 0.22f);
+constexpr int32_t moveDivideNum = 64;
 
-#define STOP 				0			// Stop
-#define CURRENT_NORMAL_MA   300   // steady-state current for 33 mm^3/s feed rate
-// #define CURRENT_NORMAL_MA   900   // steady-state current for 66 mm^3/s feed rate
-#define CURRENT_BUTTON_MA   900   // boost current while a key is held (66 mm^3/s)
-#define WRITE_EN_PIN(x) digitalWrite(EN_PIN,x)// Enable Pin Write
-#define FORWARD				1			// Filament Direction
-#define BACK				0
+constexpr uint32_t _rpmToVactual(uint32_t rpm) {
+    return static_cast<uint32_t>(
+        (static_cast<float>(rpm) * static_cast<float>(moveDivideNum) * 200.0f) /
+        (60.0f * 0.715f)
+    );
+}
 
-#define DEBUG 				0
+constexpr uint32_t vactualNormal = _rpmToVactual(speedNormalRpm);
+constexpr uint32_t vactualButton = _rpmToVactual(speedButtonRpm);
+constexpr uint32_t vactualMedium = _rpmToVactual((speedNormalRpm + speedButtonRpm) / 2U);
 
-// Input states
-typedef struct Buffer {
-	bool buffer1_pos1_sensor_state;	
-	bool buffer1_pos2_sensor_state;		
-	bool buffer1_pos3_sensor_state;		
-	bool buffer1_material_swtich_state;	
-	bool key_reverse;
-	bool key_forward;
-} Buffer;
+constexpr uint32_t stopValue = 0;
+constexpr uint16_t currentNormalMa = 300;
+constexpr uint16_t currentButtonMa = 900;
 
-// Output stepper states
-typedef enum {
-	Forward = 0,	// Forward
-	Stop,			// Stop
-	Back			// Reverse
-} Motor_State;
+// MCP23017 address
+constexpr uint8_t mcpAddress = 0x20;
 
-extern void buffer_sensor_init();
-extern void buffer_motor_init();
+struct BufferState {
+    bool pos1SensorState = false;
+    bool pos2SensorState = false;
+    bool pos3SensorState = false;
+    bool materialSwitchState = false;
 
-extern void read_sensor_state(void);
-extern void motor_control(void);
+    bool localReversePressed = false;
+    bool localForwardPressed = false;
 
-extern void buffer_init();
-extern void buffer_loop(void);
-extern void timer_it_callback();
-extern void buffer_debug(void);
+    bool panelOverridePressed = false;
+    bool panelCancelPressed = false;
+    bool panelSpeedIncPressed = false;
+    bool panelResetPressed = false;
+    bool panelForwardPressed = false;
+    bool panelReversePressed = false;
+    bool panelSpeedDecPressed = false;
+};
 
-extern bool is_error;
-extern uint32_t front_time;	// Forward time
-extern uint32_t timeout;
-extern bool is_front;
+enum class MotorState : uint8_t {
+    forward = 0,
+    stop,
+    back
+};
+
+void bufferSensorInit();
+void bufferMotorInit();
+void readSensorState();
+void motorControl();
+
+void bufferInit();
+void bufferLoop();
+void timerItCallback();
+void bufferDebug();
+
+extern bool isError;
+extern uint32_t frontTime;
+extern uint32_t timeoutMs;
+extern bool isFront;
 extern TMC2209Stepper driver;
 
 #endif

@@ -2,13 +2,14 @@
 #include "buffer.h"
 
 void setup() {
+    delay(1000);
     Serial.begin(115200);
-    Serial.dtr(false);
-    buffer_init();
-
+    delay(500);
+    Serial.println();
+    Serial.println("boot");
+    bufferInit();
 }
 
 void loop() {
-    buffer_loop();
+    bufferLoop();
 }
-
