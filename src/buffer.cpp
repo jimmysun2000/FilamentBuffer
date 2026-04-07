@@ -136,7 +136,7 @@ static uint32_t _makeBootJitterSeed() {
 
 static uint32_t _getRandomMotorInitDelayMs() {
     randomSeed(_makeBootJitterSeed());
-    return static_cast<uint32_t>(random(100, 1001));
+    return static_cast<uint32_t>(random(1000, 5000));
 }
 
 static void _setMotorCurrent(uint16_t currentMa) {
