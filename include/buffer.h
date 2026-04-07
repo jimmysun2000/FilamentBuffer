@@ -56,8 +56,19 @@ constexpr uint32_t vactualButton = _rpmToVactual(speedButtonRpm);
 constexpr uint32_t vactualMedium = _rpmToVactual((speedNormalRpm + speedButtonRpm) / 2U);
 
 constexpr uint32_t stopValue = 0;
-constexpr uint16_t currentNormalMa = 300;
+
+// Current settings
+constexpr uint16_t currentAutoMa = 600;
 constexpr uint16_t currentButtonMa = 900;
+
+// Timeout / retry settings
+constexpr uint32_t defaultTimeoutMs = 10000;
+constexpr uint8_t maxAutoRetries = 6;
+constexpr uint32_t autoRetryPauseMs = 400;
+
+// Status LED heartbeat
+constexpr uint32_t statusLedPeriodMs = 3000;
+constexpr uint32_t statusLedOffPulseMs = 120;
 
 // MCP23017 address
 constexpr uint8_t mcpAddress = 0x20;

@@ -4,21 +4,24 @@ TMC2209Stepper driver(uartPin, uartPin, rSense, driverAddress);
 
 bool isError = false;
 uint32_t frontTime = 0;
-uint32_t timeoutMs = 60000;
+uint32_t timeoutMs = defaultTimeoutMs;
 bool isFront = false;
 
 static BufferState bufferState = {};
 static String serialBuffer;
 static HardwareTimer timer6(TIM6);
-static bool forceAutoRefresh = false;
 
-static uint16_t currentCached = currentNormalMa;
+static uint16_t currentCached = currentAutoMa;
 static MotorState motorState = MotorState::stop;
-static MotorState lastAutoMotorState = MotorState::stop;
-static MotorState panelLatchedMotorState = MotorState::stop;
 
-static const int eepromAddrTimeout = 0;
-static const uint32_t defaultTimeoutMs = 60000;
+// Auto retry state
+static volatile bool autoRetryRequested = false;
+static bool autoRetryPauseActive = false;
+static uint32_t autoRetryPauseUntilMs = 0;
+static uint8_t autoRetryCount = 0;
+
+// Auto refresh state
+static bool forceAutoRefresh = false;
 
 // MCP state
 static bool mcpPresent = false;
@@ -26,10 +29,13 @@ static uint16_t mcpOlatShadow = 0xFFFF;
 static uint8_t mcpGpioACache = 0x7F;
 static uint8_t previousMcpGpioA = 0x7F;
 
+// Panel motion state
 static bool mcpOverrideLatched = false;
-static uint8_t mcpManualSpeedIndex = 2; // default high, matches original button jog speed
-static bool statusBlinkState = false;
-static uint32_t lastStatusToggleMs = 0;
+static uint8_t mcpManualSpeedIndex = 2;
+static MotorState panelLatchedMotorState = MotorState::stop;
+
+// EEPROM
+static const int eepromAddrTimeout = 0;
 
 // MCP23017 registers
 constexpr uint8_t mcpIodirA = 0x00;
@@ -66,6 +72,7 @@ static const uint32_t mcpManualVactualTable[3] = {
 
 constexpr uint16_t swI2cDelayUs = 6;
 
+// Forward declarations
 static void _setMotorCurrent(uint16_t currentMa);
 static void _setLocalLed(uint8_t pin, bool on);
 static void _setDirectionLeds(bool forwardOn, bool reverseOn);
@@ -76,6 +83,7 @@ static bool _runLocalManualMotion();
 static bool _runPanelManualMotion();
 static void _applyAutomaticMotorControl();
 static void _runStartupLedSequence();
+static bool _getStatusLedOn();
 static uint32_t _makeBootJitterSeed();
 static uint32_t _getRandomMotorInitDelayMs();
 
@@ -110,35 +118,6 @@ static void _setPanelLed(uint8_t pin, bool on);
 static void _pulsePanelLed(uint8_t pin, const char *name);
 static void _runMcpLedSequence();
 
-static uint32_t _makeBootJitterSeed() {
-    uint32_t seed = micros();
-
-    seed ^= static_cast<uint32_t>(digitalRead(hall1Pin)) << 0;
-    seed ^= static_cast<uint32_t>(digitalRead(hall2Pin)) << 1;
-    seed ^= static_cast<uint32_t>(digitalRead(hall3Pin)) << 2;
-    seed ^= static_cast<uint32_t>(digitalRead(endstop3Pin)) << 3;
-    seed ^= static_cast<uint32_t>(digitalRead(keyReversePin)) << 4;
-    seed ^= static_cast<uint32_t>(digitalRead(keyForwardPin)) << 5;
-    seed ^= static_cast<uint32_t>(digitalRead(keyForward2Pin)) << 6;
-    seed ^= static_cast<uint32_t>(digitalRead(keyReverse2Pin)) << 7;
-
-    for (uint8_t i = 0; i < 16; ++i) {
-        seed ^= micros() << (i & 0x07);
-        delayMicroseconds(37);
-    }
-
-    if (seed == 0) {
-        seed = 0xA5A5A5A5UL;
-    }
-
-    return seed;
-}
-
-static uint32_t _getRandomMotorInitDelayMs() {
-    randomSeed(_makeBootJitterSeed());
-    return static_cast<uint32_t>(random(1000, 5000));
-}
-
 static void _setMotorCurrent(uint16_t currentMa) {
     if (currentMa != currentCached) {
         driver.rms_current(currentMa);
@@ -147,7 +126,7 @@ static void _setMotorCurrent(uint16_t currentMa) {
 }
 
 static void _setLocalLed(uint8_t pin, bool on) {
-    // Local LEDs are active-low in your original code
+    // Local LEDs remain active-low
     digitalWrite(pin, on ? LOW : HIGH);
 }
 
@@ -165,12 +144,17 @@ static void _allDirectionLedsOff() {
     _setDirectionLeds(false, false);
 }
 
+static bool _getStatusLedOn() {
+    const uint32_t cyclePos = millis() % statusLedPeriodMs;
+    return cyclePos >= statusLedOffPulseMs;
+}
+
 static void _setPanelLed(uint8_t pin, bool on) {
     if (!useMcp || !mcpPresent) {
         return;
     }
 
-    // Panel LEDs are active-low
+    // Flipped as requested: panel LEDs active-high
     _setMcpPinRaw(pin, on);
 }
 
@@ -200,15 +184,13 @@ static void _updatePanelIndicators() {
     }
 
     const bool filamentPresent = !bufferState.materialSwitchState;
-
-    // Only show speed LEDs when panel manual motion is actually active.
     const bool panelManualSpeedActive =
         useMcpInMotorControl &&
         (panelLatchedMotorState != MotorState::stop);
 
     _setPanelLed(ledOverridePanelPin, mcpOverrideLatched);
     _setPanelLed(ledFilamentPanelPin, filamentPresent);
-    _setPanelLed(ledStatusPanelPin, statusBlinkState);
+    _setPanelLed(ledStatusPanelPin, _getStatusLedOn());
     _setPanelLed(ledErrorPanelPin, isError);
 
     _setPanelLed(ledSpeedLowPanelPin, panelManualSpeedActive && (mcpManualSpeedIndex == 0));
@@ -259,6 +241,35 @@ static void _runStartupLedSequence() {
     if (useMcp && mcpPresent) {
         _runMcpLedSequence();
     }
+}
+
+static uint32_t _makeBootJitterSeed() {
+    uint32_t seed = micros();
+
+    seed ^= static_cast<uint32_t>(digitalRead(hall1Pin)) << 0;
+    seed ^= static_cast<uint32_t>(digitalRead(hall2Pin)) << 1;
+    seed ^= static_cast<uint32_t>(digitalRead(hall3Pin)) << 2;
+    seed ^= static_cast<uint32_t>(digitalRead(endstop3Pin)) << 3;
+    seed ^= static_cast<uint32_t>(digitalRead(keyReversePin)) << 4;
+    seed ^= static_cast<uint32_t>(digitalRead(keyForwardPin)) << 5;
+    seed ^= static_cast<uint32_t>(digitalRead(keyForward2Pin)) << 6;
+    seed ^= static_cast<uint32_t>(digitalRead(keyReverse2Pin)) << 7;
+
+    for (uint8_t i = 0; i < 16; ++i) {
+        seed ^= micros() << (i & 0x07);
+        delayMicroseconds(37);
+    }
+
+    if (seed == 0) {
+        seed = 0xA5A5A5A5UL;
+    }
+
+    return seed;
+}
+
+static uint32_t _getRandomMotorInitDelayMs() {
+    randomSeed(_makeBootJitterSeed());
+    return static_cast<uint32_t>(random(100, 1001));
 }
 
 // ===== Software I2C =====
@@ -577,12 +588,12 @@ static bool _probeMcp() {
     }
 
     bool ok = true;
-    ok &= _swI2cWriteRegister(mcpAddress, mcpIodirA, 0x7F); // GPA0..6 in, GPA7 out
-    ok &= _swI2cWriteRegister(mcpAddress, mcpIodirB, 0x00); // GPB all out
+    ok &= _swI2cWriteRegister(mcpAddress, mcpIodirA, 0x7F);
+    ok &= _swI2cWriteRegister(mcpAddress, mcpIodirB, 0x00);
     ok &= _swI2cWriteRegister(mcpAddress, mcpGppuA, 0x7F);
     ok &= _swI2cWriteRegister(mcpAddress, mcpGppuB, 0x00);
 
-    mcpOlatShadow = 0xFFFF;
+    mcpOlatShadow = 0x0000;
     ok &= _swI2cWriteWord(mcpAddress, mcpOlatA, mcpOlatShadow);
 
     if (!ok) {
@@ -631,7 +642,15 @@ static void _updateMcpButtonsFromGpioA(uint8_t gpioA) {
         isFront = false;
         frontTime = 0;
         panelLatchedMotorState = MotorState::stop;
+        autoRetryCount = 0;
+        autoRetryPauseActive = false;
+        autoRetryRequested = false;
         forceAutoRefresh = true;
+
+        driver.VACTUAL(stopValue);
+        motorState = MotorState::stop;
+        digitalWrite(enPin, HIGH);
+        _allDirectionLedsOff();
     }
 
     if (fallingEdges & (1U << swSpeedIncPin)) {
@@ -650,7 +669,6 @@ static void _updateMcpButtonsFromGpioA(uint8_t gpioA) {
         mcpOverrideLatched = !mcpOverrideLatched;
     }
 
-    // CANCEL exits latched manual mode and returns control to auto.
     if (fallingEdges & (1U << swCancelPin)) {
         panelLatchedMotorState = MotorState::stop;
         isFront = false;
@@ -658,17 +676,21 @@ static void _updateMcpButtonsFromGpioA(uint8_t gpioA) {
         forceAutoRefresh = true;
     }
 
-    // LOAD -> latched forward manual
     if (fallingEdges & (1U << swForwardPin)) {
         panelLatchedMotorState = MotorState::forward;
+        autoRetryCount = 0;
+        autoRetryPauseActive = false;
+        autoRetryRequested = false;
         isFront = false;
         frontTime = 0;
         isError = false;
     }
 
-    // UNLOAD -> latched reverse manual
     if (fallingEdges & (1U << swReversePin)) {
         panelLatchedMotorState = MotorState::back;
+        autoRetryCount = 0;
+        autoRetryPauseActive = false;
+        autoRetryRequested = false;
         isFront = false;
         frontTime = 0;
         isError = false;
@@ -705,7 +727,7 @@ void bufferMotorInit() {
     driver.beginSerial(9600);
     driver.I_scale_analog(false);
     driver.toff(5);
-    driver.rms_current(currentNormalMa);
+    driver.rms_current(currentAutoMa);
     driver.microsteps(moveDivideNum);
     driver.VACTUAL(stopValue);
     driver.en_spreadCycle(true);
@@ -713,7 +735,6 @@ void bufferMotorInit() {
 }
 
 void readSensorState() {
-    // Keep the same logical mapping as your working code
     bufferState.pos1SensorState = digitalRead(hall3Pin) == HIGH;
     bufferState.pos2SensorState = digitalRead(hall2Pin) == HIGH;
     bufferState.pos3SensorState = digitalRead(hall1Pin) == HIGH;
@@ -744,10 +765,7 @@ void readSensorState() {
 }
 
 static bool _runLocalManualMotion() {
-    const bool reversePressed = bufferState.localReversePressed;
-    const bool forwardPressed = bufferState.localForwardPressed;
-
-    if (reversePressed && forwardPressed) {
+    if (bufferState.localReversePressed && bufferState.localForwardPressed) {
         driver.VACTUAL(stopValue);
         motorState = MotorState::stop;
         digitalWrite(enPin, HIGH);
@@ -755,7 +773,13 @@ static bool _runLocalManualMotion() {
         return true;
     }
 
-    if (reversePressed) {
+    if (bufferState.localReversePressed) {
+        panelLatchedMotorState = MotorState::stop;
+        autoRetryCount = 0;
+        autoRetryPauseActive = false;
+        autoRetryRequested = false;
+        forceAutoRefresh = false;
+
         _setDirectionLeds(false, true);
         digitalWrite(enPin, LOW);
         driver.VACTUAL(stopValue);
@@ -770,16 +794,22 @@ static bool _runLocalManualMotion() {
 
         driver.VACTUAL(stopValue);
         motorState = MotorState::stop;
-
         isFront = false;
         frontTime = 0;
         isError = false;
         digitalWrite(enPin, HIGH);
         _allDirectionLedsOff();
+        forceAutoRefresh = true;
         return true;
     }
 
-    if (forwardPressed) {
+    if (bufferState.localForwardPressed) {
+        panelLatchedMotorState = MotorState::stop;
+        autoRetryCount = 0;
+        autoRetryPauseActive = false;
+        autoRetryRequested = false;
+        forceAutoRefresh = false;
+
         _setDirectionLeds(true, false);
         digitalWrite(enPin, LOW);
         driver.VACTUAL(stopValue);
@@ -794,12 +824,12 @@ static bool _runLocalManualMotion() {
 
         driver.VACTUAL(stopValue);
         motorState = MotorState::stop;
-
         isFront = false;
         frontTime = 0;
         isError = false;
         digitalWrite(enPin, HIGH);
         _allDirectionLedsOff();
+        forceAutoRefresh = true;
         return true;
     }
 
@@ -860,6 +890,23 @@ static void _applyAutomaticMotorControl() {
 
     constexpr uint32_t autoInvalidGraceMs = 120;
 
+    if (autoRetryPauseActive) {
+        if (millis() < autoRetryPauseUntilMs) {
+            if (motorState != MotorState::stop) {
+                driver.VACTUAL(stopValue);
+                motorState = MotorState::stop;
+                digitalWrite(enPin, HIGH);
+                _allDirectionLedsOff();
+            }
+            isFront = false;
+            frontTime = 0;
+            return;
+        }
+
+        autoRetryPauseActive = false;
+        forceAutoRefresh = true;
+    }
+
     const bool pos1 = bufferState.pos1SensorState;
     const bool pos2 = bufferState.pos2SensorState;
     const bool pos3 = bufferState.pos3SensorState;
@@ -892,7 +939,6 @@ static void _applyAutomaticMotorControl() {
         }
     }
 
-    // Auto load speed = low manual load speed
     const uint32_t autoVactual = mcpManualVactualTable[0];
 
     if (requestedState == MotorState::forward) {
@@ -900,9 +946,11 @@ static void _applyAutomaticMotorControl() {
     } else {
         isFront = false;
         frontTime = 0;
+        autoRetryCount = 0;
+        autoRetryPauseActive = false;
+        autoRetryRequested = false;
     }
 
-    // Only skip if state matches AND we are not forcing an auto-speed refresh
     if (!forceAutoRefresh && requestedState == motorState) {
         return;
     }
@@ -913,7 +961,7 @@ static void _applyAutomaticMotorControl() {
         case MotorState::forward: {
             motorState = MotorState::forward;
             digitalWrite(enPin, LOW);
-            _setMotorCurrent(currentNormalMa);
+            _setMotorCurrent(currentAutoMa);
             driver.shaft(1);
             driver.VACTUAL(autoVactual);
             _setDirectionLeds(true, false);
@@ -930,7 +978,7 @@ static void _applyAutomaticMotorControl() {
         case MotorState::back: {
             motorState = MotorState::back;
             digitalWrite(enPin, LOW);
-            _setMotorCurrent(currentNormalMa);
+            _setMotorCurrent(currentAutoMa);
             driver.shaft(0);
             driver.VACTUAL(autoVactual);
             _setDirectionLeds(false, true);
@@ -942,6 +990,23 @@ static void _applyAutomaticMotorControl() {
 }
 
 void motorControl() {
+    if (autoRetryRequested) {
+        noInterrupts();
+        autoRetryRequested = false;
+        interrupts();
+
+        driver.VACTUAL(stopValue);
+        motorState = MotorState::stop;
+        digitalWrite(enPin, HIGH);
+        _allDirectionLedsOff();
+
+        autoRetryPauseActive = true;
+        autoRetryPauseUntilMs = millis() + autoRetryPauseMs;
+        isFront = false;
+        frontTime = 0;
+        return;
+    }
+
     if (_runLocalManualMotion()) {
         return;
     }
@@ -964,6 +1029,9 @@ void motorControl() {
         driver.VACTUAL(stopValue);
         motorState = MotorState::stop;
         panelLatchedMotorState = MotorState::stop;
+        autoRetryCount = 0;
+        autoRetryPauseActive = false;
+        autoRetryRequested = false;
         isFront = false;
         frontTime = 0;
         isError = false;
@@ -997,6 +1065,8 @@ static void _handleSerial() {
     if (serialBuffer == "rt") {
         Serial.print("read timeout=");
         Serial.println(timeoutMs);
+        Serial.print("retry count=");
+        Serial.println(autoRetryCount);
         serialBuffer = "";
         return;
     }
@@ -1088,11 +1158,6 @@ void bufferInit() {
 }
 
 void bufferLoop() {
-    if (millis() - lastStatusToggleMs >= 500) {
-        lastStatusToggleMs = millis();
-        statusBlinkState = !statusBlinkState;
-    }
-
     readSensorState();
 
     if (debugEnabled) {
@@ -1105,11 +1170,24 @@ void bufferLoop() {
 }
 
 void timerItCallback() {
-    if (isFront) {
-        ++frontTime;
-        if (frontTime > timeoutMs) {
-            isError = true;
-        }
+    if (!isFront) {
+        return;
+    }
+
+    ++frontTime;
+
+    if (frontTime <= timeoutMs) {
+        return;
+    }
+
+    isFront = false;
+    frontTime = 0;
+
+    if (autoRetryCount < maxAutoRetries) {
+        ++autoRetryCount;
+        autoRetryRequested = true;
+    } else {
+        isError = true;
     }
 }
 
@@ -1133,6 +1211,14 @@ void bufferDebug() {
     Serial.print(" override=");
     Serial.print(mcpOverrideLatched);
     Serial.print(" speedIdx=");
-    Serial.println(mcpManualSpeedIndex);
+    Serial.print(mcpManualSpeedIndex);
+    Serial.print(" panelLatched=");
+    Serial.print(static_cast<int>(panelLatchedMotorState));
+    Serial.print(" retryCount=");
+    Serial.print(autoRetryCount);
+    Serial.print(" retryPause=");
+    Serial.print(autoRetryPauseActive);
+    Serial.print(" timeoutMs=");
+    Serial.println(timeoutMs);
     delay(300);
 }
