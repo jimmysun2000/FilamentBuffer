@@ -1,11 +1,13 @@
 #include "buffer.h"
 
+#include <IWatchdog.h>
+
 TMC2209Stepper driver(uartPin, uartPin, rSense, driverAddress);
 
 bool isError = false;
-uint32_t frontTime = 0;
+volatile uint32_t frontTime = 0;
 uint32_t timeoutMs = defaultTimeoutMs;
-bool isFront = false;
+volatile bool isFront = false;
 
 static BufferState bufferState = {};
 static String serialBuffer;
@@ -17,25 +19,77 @@ static MotorState motorState = MotorState::stop;
 // Auto retry state
 static volatile bool autoRetryRequested = false;
 static bool autoRetryPauseActive = false;
-static uint32_t autoRetryPauseUntilMs = 0;
+static uint32_t autoRetryPauseStartMs = 0;
 static uint8_t autoRetryCount = 0;
 
 // Auto refresh state
 static bool forceAutoRefresh = false;
+
+// Runaway feed guard state
+enum class FeedAccounting : uint8_t {
+    hold = 0,
+    feeding,
+    retracting,
+    idle
+};
+
+static FeedAccounting feedAccounting = FeedAccounting::hold;
+static uint32_t feedAccountLastMs = 0;
+static int32_t feedNetMs = 0;
+static uint32_t feedDwellMs = 0;
+static bool feedSeenSinceReset = false;
+static volatile bool feedPrimed = false;
+
+// Debounced inputs
+struct DebouncedInput {
+    bool stable = false;
+    bool candidate = false;
+    uint32_t candidateSinceMs = 0;
+};
+
+static DebouncedInput runoutInput;
+static DebouncedInput localReverseInput;
+static DebouncedInput localForwardInput;
+
+// Local button motion state. The lockout starts set so a button that is
+// already held (or stuck) at power-up does nothing until it is released.
+static MotorState localManualState = MotorState::stop;
+static uint32_t localManualStartMs = 0;
+static bool localManualLockout = true;
+
+// Driver refresh state
+static uint32_t driverRefreshLastMs = 0;
+
+// Error state as last saved to EEPROM
+static bool errorLatchStored = false;
+
+// Serial command state
+static uint32_t serialLastByteMs = 0;
 
 // MCP state
 static bool mcpPresent = false;
 static uint16_t mcpOlatShadow = 0xFFFF;
 static uint8_t mcpGpioACache = 0x7F;
 static uint8_t previousMcpGpioA = 0x7F;
+static uint8_t mcpCandidateGpioA = 0x7F;
+static uint32_t mcpCandidateSinceMs = 0;
+static uint8_t mcpReadFailures = 0;
+static uint32_t mcpHousekeepingLastMs = 0;
 
 // Panel motion state
 static bool mcpOverrideLatched = false;
 static uint8_t mcpManualSpeedIndex = 2;
 static MotorState panelLatchedMotorState = MotorState::stop;
+static uint32_t panelLatchStartMs = 0;
 
 // EEPROM
 static const int eepromAddrTimeout = 0;
+static const int eepromAddrErrorLatch = 4;
+constexpr uint8_t errorLatchValue = 0xE5;
+
+// Serial commands
+constexpr uint32_t serialIdleGapMs = 50;
+constexpr uint8_t serialMaxCommandLength = 24;
 
 // MCP23017 registers
 constexpr uint8_t mcpIodirA = 0x00;
@@ -79,9 +133,21 @@ static void _setDirectionLeds(bool forwardOn, bool reverseOn);
 static void _allDirectionLedsOff();
 static void _updatePanelIndicators();
 static void _handleSerial();
+static void _runSerialCommand(const String &command);
+static void _printDriverCheck();
+static void _configureDriver();
+static void _refreshDriverWhileIdle();
+static void _syncErrorLatch();
+static bool _debounce(DebouncedInput &input, bool raw);
+static void _startLocalManualMotion(MotorState direction);
+static void _stopLocalManualMotion();
 static bool _runLocalManualMotion();
 static bool _runPanelManualMotion();
 static void _applyAutomaticMotorControl();
+static int32_t _getLoadFeedBudgetMs();
+static int32_t _getFeedBudgetMs();
+static void _resetFeedGuard();
+static void _accountFeedTime();
 static void _runStartupLedSequence();
 static bool _getStatusLedOn();
 static uint32_t _makeBootJitterSeed();
@@ -110,7 +176,11 @@ static bool _swI2cReadRegister(uint8_t deviceAddress, uint8_t regAddress, uint8_
 static bool _swI2cProbeAddress(uint8_t deviceAddress);
 
 // MCP helpers
-static bool _probeMcp();
+static bool _writeMcpSetup();
+static bool _probeMcp(bool verbose);
+static void _dropPanel();
+static void _debouncePanelInputs(uint8_t gpioA);
+static void _servicePanel();
 static bool _readMcpGpioA(uint8_t &gpioA);
 static void _updateMcpButtonsFromGpioA(uint8_t gpioA);
 static void _setMcpPinRaw(uint8_t pin, bool highLevel);
@@ -566,7 +636,18 @@ static bool _swI2cProbeAddress(uint8_t deviceAddress) {
 
 // ===== MCP helpers =====
 
-static bool _probeMcp() {
+// Pin directions, pull-ups and the current LED state
+static bool _writeMcpSetup() {
+    bool ok = true;
+    ok &= _swI2cWriteRegister(mcpAddress, mcpIodirA, 0x7F);
+    ok &= _swI2cWriteRegister(mcpAddress, mcpIodirB, 0x00);
+    ok &= _swI2cWriteRegister(mcpAddress, mcpGppuA, 0x7F);
+    ok &= _swI2cWriteRegister(mcpAddress, mcpGppuB, 0x00);
+    ok &= _swI2cWriteWord(mcpAddress, mcpOlatA, mcpOlatShadow);
+    return ok;
+}
+
+static bool _probeMcp(bool verbose) {
     if (!useMcp) {
         mcpPresent = false;
         return false;
@@ -580,35 +661,39 @@ static bool _probeMcp() {
 
     mcpPresent = _swI2cProbeAddress(mcpAddress);
 
-    Serial.print("mcp present: ");
-    Serial.println(mcpPresent ? "yes" : "no");
+    if (verbose) {
+        Serial.print("mcp present: ");
+        Serial.println(mcpPresent ? "yes" : "no");
+    }
 
     if (!mcpPresent) {
         return false;
     }
 
-    bool ok = true;
-    ok &= _swI2cWriteRegister(mcpAddress, mcpIodirA, 0x7F);
-    ok &= _swI2cWriteRegister(mcpAddress, mcpIodirB, 0x00);
-    ok &= _swI2cWriteRegister(mcpAddress, mcpGppuA, 0x7F);
-    ok &= _swI2cWriteRegister(mcpAddress, mcpGppuB, 0x00);
-
     mcpOlatShadow = 0x0000;
-    ok &= _swI2cWriteWord(mcpAddress, mcpOlatA, mcpOlatShadow);
 
-    if (!ok) {
-        Serial.println("mcp config failed");
+    if (!_writeMcpSetup()) {
+        if (verbose) {
+            Serial.println("mcp config failed");
+        }
         mcpPresent = false;
         return false;
     }
 
+    // Start from the buttons as they are now, so one that is already held is not a new press
     uint8_t gpioA = 0x7F;
     if (_swI2cReadRegister(mcpAddress, mcpGpioA, gpioA)) {
         mcpGpioACache = gpioA;
-        previousMcpGpioA = gpioA;
     }
 
-    Serial.println("mcp config ok");
+    previousMcpGpioA = gpioA & 0x7F;
+    mcpCandidateGpioA = previousMcpGpioA;
+    mcpReadFailures = 0;
+    mcpHousekeepingLastMs = millis();
+
+    if (verbose) {
+        Serial.println("mcp config ok");
+    }
     return true;
 }
 
@@ -646,6 +731,13 @@ static void _updateMcpButtonsFromGpioA(uint8_t gpioA) {
         autoRetryPauseActive = false;
         autoRetryRequested = false;
         forceAutoRefresh = true;
+        _resetFeedGuard();
+
+        if (localManualState != MotorState::stop) {
+            // Reset also ends a local button feed; the button has to be released first
+            localManualState = MotorState::stop;
+            localManualLockout = true;
+        }
 
         driver.VACTUAL(stopValue);
         motorState = MotorState::stop;
@@ -678,6 +770,8 @@ static void _updateMcpButtonsFromGpioA(uint8_t gpioA) {
 
     if (fallingEdges & (1U << swForwardPin)) {
         panelLatchedMotorState = MotorState::forward;
+        panelLatchStartMs = millis();
+        _resetFeedGuard();
         autoRetryCount = 0;
         autoRetryPauseActive = false;
         autoRetryRequested = false;
@@ -688,6 +782,8 @@ static void _updateMcpButtonsFromGpioA(uint8_t gpioA) {
 
     if (fallingEdges & (1U << swReversePin)) {
         panelLatchedMotorState = MotorState::back;
+        panelLatchStartMs = millis();
+        _resetFeedGuard();
         autoRetryCount = 0;
         autoRetryPauseActive = false;
         autoRetryRequested = false;
@@ -695,6 +791,96 @@ static void _updateMcpButtonsFromGpioA(uint8_t gpioA) {
         frontTime = 0;
         isError = false;
     }
+}
+
+// The panel stopped answering: forget it until it can be set up again
+static void _dropPanel() {
+    mcpPresent = false;
+    mcpReadFailures = 0;
+    mcpHousekeepingLastMs = millis();
+
+    // Nothing is held any more, and nobody can press Cancel
+    _updateMcpButtonsFromGpioA(0x7F);
+    mcpCandidateGpioA = 0x7F;
+
+    if (panelLatchedMotorState != MotorState::stop) {
+        panelLatchedMotorState = MotorState::stop;
+        forceAutoRefresh = true;
+    }
+
+    _swI2cBusRecovery();
+}
+
+static void _debouncePanelInputs(uint8_t gpioA) {
+    const uint32_t nowMs = millis();
+
+    if (gpioA != mcpCandidateGpioA) {
+        mcpCandidateGpioA = gpioA;
+        mcpCandidateSinceMs = nowMs;
+        return;
+    }
+
+    if (gpioA == previousMcpGpioA || (nowMs - mcpCandidateSinceMs) < panelDebounceMs) {
+        return;
+    }
+
+    // A panel chip that reset has lost its pull-ups, so its inputs float and
+    // read as presses. Check before believing a change.
+    uint8_t pullups = 0;
+    if (!_swI2cReadRegister(mcpAddress, mcpGppuA, pullups) || pullups != 0x7F) {
+        _writeMcpSetup();
+        mcpCandidateGpioA = previousMcpGpioA;
+        return;
+    }
+
+    _updateMcpButtonsFromGpioA(gpioA);
+}
+
+static void _servicePanel() {
+    if (!useMcp) {
+        return;
+    }
+
+    const uint32_t nowMs = millis();
+    const bool housekeepingDue = (nowMs - mcpHousekeepingLastMs) >= panelSetupRefreshMs;
+
+    if (!mcpPresent) {
+        if (housekeepingDue) {
+            mcpHousekeepingLastMs = nowMs;
+            _probeMcp(false);
+        }
+        return;
+    }
+
+    if (housekeepingDue) {
+        // Restores pin directions, pull-ups and LEDs if the panel chip lost power
+        mcpHousekeepingLastMs = nowMs;
+        _writeMcpSetup();
+    }
+
+    uint8_t gpioA = 0x7F;
+    if (!_readMcpGpioA(gpioA)) {
+        if (++mcpReadFailures >= panelMaxReadFailures) {
+            _dropPanel();
+        }
+        return;
+    }
+
+    mcpReadFailures = 0;
+    _debouncePanelInputs(gpioA & 0x7F);
+}
+
+static bool _debounce(DebouncedInput &input, bool raw) {
+    const uint32_t nowMs = millis();
+
+    if (raw != input.candidate) {
+        input.candidate = raw;
+        input.candidateSinceMs = nowMs;
+    } else if (raw != input.stable && (nowMs - input.candidateSinceMs) >= inputDebounceMs) {
+        input.stable = raw;
+    }
+
+    return input.stable;
 }
 
 void bufferSensorInit() {
@@ -712,9 +898,40 @@ void bufferSensorInit() {
     pinMode(ledForwardPin, OUTPUT);
     _allDirectionLedsOff();
 
+    // Start the runout filter from the real switch state so boot does not
+    // briefly believe filament is loaded
+    runoutInput.stable = digitalRead(endstop3Pin) == HIGH;
+    runoutInput.candidate = runoutInput.stable;
+
     if (useMcp) {
-        _probeMcp();
+        _probeMcp(true);
     }
+}
+
+// Sends every driver setting. Only call this while the motor is stopped.
+static void _configureDriver() {
+    driver.I_scale_analog(false);
+    driver.toff(5);
+    driver.rms_current(currentCached);
+    driver.microsteps(moveDivideNum);
+    driver.VACTUAL(stopValue);
+    driver.en_spreadCycle(true);
+    driver.pwm_autoscale(true);
+}
+
+// The driver forgets its settings when it loses motor power while the MCU
+// stays up (USB power, brown-out), so they are repeated whenever it is idle
+static void _refreshDriverWhileIdle() {
+    if (motorState != MotorState::stop) {
+        return;
+    }
+
+    if (millis() - driverRefreshLastMs < driverRefreshIntervalMs) {
+        return;
+    }
+
+    driverRefreshLastMs = millis();
+    _configureDriver();
 }
 
 void bufferMotorInit() {
@@ -722,50 +939,104 @@ void bufferMotorInit() {
     pinMode(stepPin, OUTPUT);
     pinMode(dirMotorPin, OUTPUT);
 
-    digitalWrite(enPin, LOW);
+    // The driver takes its settings while disabled; motor control enables it
+    // when it starts a move
+    digitalWrite(enPin, HIGH);
 
     driver.beginSerial(9600);
-    driver.I_scale_analog(false);
-    driver.toff(5);
-    driver.rms_current(currentAutoMa);
-    driver.microsteps(moveDivideNum);
-    driver.VACTUAL(stopValue);
-    driver.en_spreadCycle(true);
-    driver.pwm_autoscale(true);
+    _configureDriver();
+    driverRefreshLastMs = millis();
 }
 
 void readSensorState() {
     bufferState.pos1SensorState = digitalRead(hall3Pin) == HIGH;
     bufferState.pos2SensorState = digitalRead(hall2Pin) == HIGH;
     bufferState.pos3SensorState = digitalRead(hall1Pin) == HIGH;
-    bufferState.materialSwitchState = digitalRead(endstop3Pin) == HIGH;
 
-    bufferState.localReversePressed =
-        (digitalRead(keyReversePin) == LOW) ||
-        (digitalRead(keyReverse2Pin) == LOW);
+    bufferState.materialSwitchState =
+        _debounce(runoutInput, digitalRead(endstop3Pin) == HIGH);
 
-    bufferState.localForwardPressed =
-        (digitalRead(keyForwardPin) == LOW) ||
-        (digitalRead(keyForward2Pin) == LOW);
+    bufferState.localReversePressed = _debounce(
+        localReverseInput,
+        (digitalRead(keyReversePin) == LOW) || (digitalRead(keyReverse2Pin) == LOW));
 
-    if (useMcp && mcpPresent) {
-        uint8_t gpioA = 0x7F;
-        if (_readMcpGpioA(gpioA)) {
-            _updateMcpButtonsFromGpioA(gpioA);
-        }
-    } else {
-        bufferState.panelOverridePressed = false;
-        bufferState.panelCancelPressed = false;
-        bufferState.panelSpeedIncPressed = false;
-        bufferState.panelResetPressed = false;
-        bufferState.panelForwardPressed = false;
-        bufferState.panelReversePressed = false;
-        bufferState.panelSpeedDecPressed = false;
-    }
+    bufferState.localForwardPressed = _debounce(
+        localForwardInput,
+        (digitalRead(keyForwardPin) == LOW) || (digitalRead(keyForward2Pin) == LOW));
+
+    _servicePanel();
+}
+
+static void _startLocalManualMotion(MotorState direction) {
+    const bool forward = (direction == MotorState::forward);
+
+    panelLatchedMotorState = MotorState::stop;
+    autoRetryCount = 0;
+    autoRetryPauseActive = false;
+    autoRetryRequested = false;
+    forceAutoRefresh = false;
+    isFront = false;
+    frontTime = 0;
+
+    _setDirectionLeds(forward, !forward);
+    digitalWrite(enPin, LOW);
+    driver.VACTUAL(stopValue);
+    _setMotorCurrent(currentButtonMa);
+
+    driver.shaft(forward ? 1 : 0);
+    driver.VACTUAL(vactualButton);
+
+    motorState = direction;
+    localManualState = direction;
+    localManualStartMs = millis();
+}
+
+static void _stopLocalManualMotion() {
+    driver.VACTUAL(stopValue);
+    motorState = MotorState::stop;
+    localManualState = MotorState::stop;
+    isFront = false;
+    frontTime = 0;
+    isError = false;
+    digitalWrite(enPin, HIGH);
+    _allDirectionLedsOff();
+    forceAutoRefresh = true;
+    _resetFeedGuard();
 }
 
 static bool _runLocalManualMotion() {
-    if (bufferState.localReversePressed && bufferState.localForwardPressed) {
+    const bool reversePressed = bufferState.localReversePressed;
+    const bool forwardPressed = bufferState.localForwardPressed;
+
+    if (!reversePressed && !forwardPressed) {
+        localManualLockout = false;
+    }
+
+    if (localManualState != MotorState::stop) {
+        const bool stillHeld =
+            (localManualState == MotorState::back) ? reversePressed : forwardPressed;
+        const bool capReached = (millis() - localManualStartMs) >= localButtonMaxMs;
+
+        if (stillHeld && !capReached) {
+            // The local buttons win over anything pressed on the panel meanwhile
+            panelLatchedMotorState = MotorState::stop;
+            return true;
+        }
+
+        if (stillHeld) {
+            // Held past the cap (stuck button, shorted wire): ignore it until released
+            localManualLockout = true;
+        }
+
+        _stopLocalManualMotion();
+        return true;
+    }
+
+    if (localManualLockout) {
+        return false;
+    }
+
+    if (reversePressed && forwardPressed) {
         driver.VACTUAL(stopValue);
         motorState = MotorState::stop;
         digitalWrite(enPin, HIGH);
@@ -773,63 +1044,13 @@ static bool _runLocalManualMotion() {
         return true;
     }
 
-    if (bufferState.localReversePressed) {
-        panelLatchedMotorState = MotorState::stop;
-        autoRetryCount = 0;
-        autoRetryPauseActive = false;
-        autoRetryRequested = false;
-        forceAutoRefresh = false;
-
-        _setDirectionLeds(false, true);
-        digitalWrite(enPin, LOW);
-        driver.VACTUAL(stopValue);
-        _setMotorCurrent(currentButtonMa);
-
-        driver.shaft(0);
-        driver.VACTUAL(vactualButton);
-
-        while ((digitalRead(keyReversePin) == LOW) || (digitalRead(keyReverse2Pin) == LOW)) {
-            delay(1);
-        }
-
-        driver.VACTUAL(stopValue);
-        motorState = MotorState::stop;
-        isFront = false;
-        frontTime = 0;
-        isError = false;
-        digitalWrite(enPin, HIGH);
-        _allDirectionLedsOff();
-        forceAutoRefresh = true;
+    if (reversePressed) {
+        _startLocalManualMotion(MotorState::back);
         return true;
     }
 
-    if (bufferState.localForwardPressed) {
-        panelLatchedMotorState = MotorState::stop;
-        autoRetryCount = 0;
-        autoRetryPauseActive = false;
-        autoRetryRequested = false;
-        forceAutoRefresh = false;
-
-        _setDirectionLeds(true, false);
-        digitalWrite(enPin, LOW);
-        driver.VACTUAL(stopValue);
-        _setMotorCurrent(currentButtonMa);
-
-        driver.shaft(1);
-        driver.VACTUAL(vactualButton);
-
-        while ((digitalRead(keyForwardPin) == LOW) || (digitalRead(keyForward2Pin) == LOW)) {
-            delay(1);
-        }
-
-        driver.VACTUAL(stopValue);
-        motorState = MotorState::stop;
-        isFront = false;
-        frontTime = 0;
-        isError = false;
-        digitalWrite(enPin, HIGH);
-        _allDirectionLedsOff();
-        forceAutoRefresh = true;
+    if (forwardPressed) {
+        _startLocalManualMotion(MotorState::forward);
         return true;
     }
 
@@ -842,6 +1063,13 @@ static bool _runPanelManualMotion() {
     }
 
     if (panelLatchedMotorState == MotorState::stop) {
+        return false;
+    }
+
+    if (millis() - panelLatchStartMs >= panelLatchMaxMs) {
+        // Nobody cancelled the latched motion, so hand back to automatic control
+        panelLatchedMotorState = MotorState::stop;
+        forceAutoRefresh = true;
         return false;
     }
 
@@ -891,7 +1119,7 @@ static void _applyAutomaticMotorControl() {
     constexpr uint32_t autoInvalidGraceMs = 120;
 
     if (autoRetryPauseActive) {
-        if (millis() < autoRetryPauseUntilMs) {
+        if (millis() - autoRetryPauseStartMs < autoRetryPauseMs) {
             if (motorState != MotorState::stop) {
                 driver.VACTUAL(stopValue);
                 motorState = MotorState::stop;
@@ -943,12 +1171,16 @@ static void _applyAutomaticMotorControl() {
 
     if (requestedState == MotorState::forward) {
         isFront = true;
+        feedAccounting = FeedAccounting::feeding;
     } else {
         isFront = false;
         frontTime = 0;
         autoRetryCount = 0;
         autoRetryPauseActive = false;
         autoRetryRequested = false;
+        feedAccounting = (requestedState == MotorState::back)
+            ? FeedAccounting::retracting
+            : FeedAccounting::idle;
     }
 
     if (!forceAutoRefresh && requestedState == motorState) {
@@ -989,11 +1221,117 @@ static void _applyAutomaticMotorControl() {
     forceAutoRefresh = false;
 }
 
+// ===== Runaway feed guard =====
+
+static int32_t _getLoadFeedBudgetMs() {
+    constexpr uint32_t attempts = static_cast<uint32_t>(maxAutoRetries) + 1U;
+    constexpr uint32_t budgetCapMs = 0x3FFFFFFFUL;
+
+    if (timeoutMs > budgetCapMs / attempts) {
+        return static_cast<int32_t>(budgetCapMs);
+    }
+
+    return static_cast<int32_t>(timeoutMs * attempts);
+}
+
+static int32_t _getFeedBudgetMs() {
+    const int32_t loadBudgetMs = _getLoadFeedBudgetMs();
+
+    if (feedPrimed && static_cast<int32_t>(primedFeedBudgetMs) < loadBudgetMs) {
+        return static_cast<int32_t>(primedFeedBudgetMs);
+    }
+
+    return loadBudgetMs;
+}
+
+static void _resetFeedGuard() {
+    feedNetMs = 0;
+    feedDwellMs = 0;
+    feedSeenSinceReset = false;
+    feedPrimed = false;
+}
+
+// Charges the time since the previous pass to what automatic control was doing
+static void _accountFeedTime() {
+    constexpr uint32_t elapsedCapMs = 60000;
+
+    const uint32_t nowMs = millis();
+    uint32_t elapsedMs = nowMs - feedAccountLastMs;
+    feedAccountLastMs = nowMs;
+
+    if (elapsedMs > elapsedCapMs) {
+        elapsedMs = elapsedCapMs;
+    }
+
+    const int32_t elapsed = static_cast<int32_t>(elapsedMs);
+
+    switch (feedAccounting) {
+        case FeedAccounting::hold: {
+            return;
+        }
+
+        case FeedAccounting::feeding: {
+            feedNetMs += elapsed;
+            feedDwellMs = 0;
+            feedSeenSinceReset = true;
+
+            if (feedNetMs > _getFeedBudgetMs()) {
+                isError = true;
+            }
+            return;
+        }
+
+        case FeedAccounting::retracting: {
+            // Filament pulled back is credit for feeding it forward again
+            const int32_t creditFloorMs = -_getLoadFeedBudgetMs();
+
+            feedNetMs -= elapsed;
+            if (feedNetMs < creditFloorMs) {
+                // Pulled back a whole load more than was ever fed: the slider
+                // is jammed in the full position or its sensor has failed
+                feedNetMs = creditFloorMs;
+                isError = true;
+            }
+            break;
+        }
+
+        case FeedAccounting::idle: {
+            if (feedNetMs > 0) {
+                feedNetMs -= elapsed * feedIdleRefundRate;
+                if (feedNetMs < 0) {
+                    feedNetMs = 0;
+                }
+            }
+            break;
+        }
+    }
+
+    if (feedDwellMs < feedPrimeDwellMs) {
+        feedDwellMs += elapsedMs;
+    }
+
+    if (!feedPrimed && feedSeenSinceReset && feedDwellMs >= feedPrimeDwellMs) {
+        // The buffer filled, so everything fed so far went where it should
+        feedPrimed = true;
+        if (feedNetMs > 0) {
+            feedNetMs = 0;
+        }
+    }
+}
+
 void motorControl() {
+    // Every path below that is not automatic control leaves the budget untouched
+    _accountFeedTime();
+    feedAccounting = FeedAccounting::hold;
+
     if (autoRetryRequested) {
         noInterrupts();
         autoRetryRequested = false;
         interrupts();
+
+        if (autoRetryCount < UINT8_MAX) {
+            ++autoRetryCount;
+        }
 
         driver.VACTUAL(stopValue);
         motorState = MotorState::stop;
@@ -1001,7 +1339,7 @@ void motorControl() {
         _allDirectionLedsOff();
 
         autoRetryPauseActive = true;
-        autoRetryPauseUntilMs = millis() + autoRetryPauseMs;
+        autoRetryPauseStartMs = millis();
         isFront = false;
         frontTime = 0;
         return;
@@ -1035,6 +1373,7 @@ void motorControl() {
         isFront = false;
         frontTime = 0;
         isError = false;
+        _resetFeedGuard();
         digitalWrite(enPin, HIGH);
         _allDirectionLedsOff();
         return;
@@ -1052,32 +1391,114 @@ void motorControl() {
     _applyAutomaticMotorControl();
 }
 
-static void _handleSerial() {
-    while (Serial.available() > 0) {
-        const char c = static_cast<char>(Serial.read());
-        serialBuffer += c;
-    }
-
-    if (serialBuffer.length() == 0) {
+// Keeps the saved error state in step with the live one, so a unit that
+// tripped stays stopped across a power cycle. Runs after motor control, so the
+// motor is already stopped before the slow EEPROM write.
+static void _syncErrorLatch() {
+    if (isError == errorLatchStored) {
         return;
     }
 
-    if (serialBuffer == "rt") {
+    errorLatchStored = isError;
+    EEPROM.write(eepromAddrErrorLatch, isError ? errorLatchValue : 0);
+}
+
+// Read-only: reports which microstep setting the driver is really using.
+// microsteps() only takes effect when mstep_reg_select is set; otherwise the
+// driver follows its MS1/MS2 pins.
+static void _printDriverCheck() {
+    const uint32_t ioin = driver.IOIN();
+
+    if (driver.CRCerror) {
+        Serial.println("driver reply=none");
+        return;
+    }
+
+    const uint32_t gconf = driver.GCONF();
+    bool allRead = !driver.CRCerror;
+    const uint32_t chopconf = driver.CHOPCONF();
+    allRead = allRead && !driver.CRCerror;
+    const uint8_t ifcnt = driver.IFCNT();
+    allRead = allRead && !driver.CRCerror;
+
+    if (!allRead) {
+        Serial.println("driver reply=partial, values below may be wrong");
+    } else {
+        Serial.println("driver reply=ok");
+    }
+
+    const uint8_t version = static_cast<uint8_t>(ioin >> 24);
+    const bool ms1 = (ioin & (1UL << 2)) != 0;
+    const bool ms2 = (ioin & (1UL << 3)) != 0;
+    const bool pdnDisable = (gconf & (1UL << 6)) != 0;
+    const bool mstepRegSelect = (gconf & (1UL << 7)) != 0;
+    const uint16_t registerMicrosteps = static_cast<uint16_t>(256U >> ((chopconf >> 24) & 0x0FU));
+
+    // TMC2209 pin table, indexed by MS2:MS1
+    static const uint8_t pinMicrostepTable[4] = {8, 32, 64, 16};
+    const bool isTmc2209 = (version == 0x21);
+    const uint8_t pinMicrosteps =
+        pinMicrostepTable[(ms2 ? 2U : 0U) | (ms1 ? 1U : 0U)];
+
+    Serial.print("version=0x");
+    Serial.print(version, HEX);
+    Serial.print(" ms1=");
+    Serial.print(ms1);
+    Serial.print(" ms2=");
+    Serial.println(ms2);
+
+    Serial.print("pdn_disable=");
+    Serial.print(pdnDisable);
+    Serial.print(" mstep_reg_select=");
+    Serial.println(mstepRegSelect);
+
+    Serial.print("register microsteps=");
+    Serial.println(registerMicrosteps);
+
+    Serial.print("pin microsteps=");
+    if (isTmc2209) {
+        Serial.println(pinMicrosteps);
+    } else {
+        Serial.println("unknown chip");
+    }
+
+    Serial.print("microsteps in use=");
+    if (mstepRegSelect) {
+        Serial.print(registerMicrosteps);
+        Serial.println(" (register)");
+    } else if (isTmc2209) {
+        Serial.print(pinMicrosteps);
+        Serial.println(" (pins)");
+    } else {
+        Serial.println("set by pins");
+    }
+
+    Serial.print("ifcnt=");
+    Serial.println(ifcnt);
+}
+
+static void _runSerialCommand(const String &command) {
+    if (command == "rt") {
         Serial.print("read timeout=");
         Serial.println(timeoutMs);
         Serial.print("retry count=");
         Serial.println(autoRetryCount);
-        serialBuffer = "";
+        Serial.print("feed used ms=");
+        Serial.print(feedNetMs);
+        Serial.print(" / ");
+        Serial.print(_getFeedBudgetMs());
+        Serial.println(feedPrimed ? " (primed)" : " (loading)");
+        Serial.print("error=");
+        Serial.println(isError);
         return;
     }
 
-    if (serialBuffer == "ml") {
+    if (command == "ml") {
         _runMcpLedSequence();
-        serialBuffer = "";
         return;
     }
 
-    if (serialBuffer == "mi") {
+    if (command == "mi") {
         Serial.print("mcp present=");
         Serial.println(mcpPresent ? "yes" : "no");
         if (mcpPresent) {
@@ -1090,30 +1511,86 @@ static void _handleSerial() {
                 Serial.println(gpioA, HEX);
             }
         }
-        serialBuffer = "";
         return;
     }
 
-    if (serialBuffer.startsWith("set")) {
-        serialBuffer.remove(0, 3);
-        const int64_t value = serialBuffer.toInt();
+    if (command == "dc") {
+        _printDriverCheck();
+        return;
+    }
 
-        if (value <= 0 || value > 0xFFFFFFFFLL) {
-            Serial.println("Error: Invalid timeout value.");
-            serialBuffer = "";
+    if (command.startsWith("set")) {
+        uint32_t value = 0;
+        uint8_t digits = 0;
+        bool valid = true;
+
+        for (unsigned int i = 3; i < command.length(); ++i) {
+            const char c = command.charAt(i);
+
+            if (c == ' ' && digits == 0) {
+                continue;
+            }
+
+            if (c < '0' || c > '9' || digits >= 6) {
+                valid = false;
+                break;
+            }
+
+            value = value * 10U + static_cast<uint32_t>(c - '0');
+            ++digits;
+        }
+
+        if (!valid || digits == 0 || value < minTimeoutMs || value > maxTimeoutMs) {
+            Serial.print("Error: timeout must be ");
+            Serial.print(minTimeoutMs);
+            Serial.print(" to ");
+            Serial.print(maxTimeoutMs);
+            Serial.println(" ms.");
             return;
         }
 
-        timeoutMs = static_cast<uint32_t>(value);
+        timeoutMs = value;
         EEPROM.put(eepromAddrTimeout, timeoutMs);
         Serial.print("set succeed! timeout=");
         Serial.println(timeoutMs);
-        serialBuffer = "";
         return;
     }
 
-    Serial.println(serialBuffer);
+    Serial.println(command);
     Serial.println("command error!");
+}
+
+static void _handleSerial() {
+    bool lineEnded = false;
+
+    while (Serial.available() > 0) {
+        const char c = static_cast<char>(Serial.read());
+        serialLastByteMs = millis();
+
+        if (c == '\r' || c == '\n') {
+            if (serialBuffer.length() > 0) {
+                lineEnded = true;
+                break;
+            }
+            continue;
+        }
+
+        if (serialBuffer.length() < serialMaxCommandLength) {
+            serialBuffer += c;
+        }
+    }
+
+    if (serialBuffer.length() == 0) {
+        return;
+    }
+
+    // Without a line ending, wait for the line to go quiet, so a command that
+    // arrives in pieces is never run half-read
+    if (!lineEnded && (millis() - serialLastByteMs) < serialIdleGapMs) {
+        return;
+    }
+
+    _runSerialCommand(serialBuffer);
     serialBuffer = "";
 }
 
@@ -1130,13 +1607,20 @@ void bufferInit() {
     delay(1000);
 
     EEPROM.get(eepromAddrTimeout, timeoutMs);
-    if (timeoutMs == 0xFFFFFFFF || timeoutMs == 0) {
+    if (timeoutMs < minTimeoutMs || timeoutMs > maxTimeoutMs) {
         timeoutMs = defaultTimeoutMs;
         EEPROM.put(eepromAddrTimeout, timeoutMs);
-        Serial.println("EEPROM is empty");
+        Serial.println("stored timeout missing or out of range, using default");
     } else {
         Serial.print("read timeout: ");
         Serial.println(timeoutMs);
+    }
+
+    // A unit that tripped stays stopped across a power cycle until it is cleared
+    errorLatchStored = EEPROM.read(eepromAddrErrorLatch) == errorLatchValue;
+    isError = errorLatchStored;
+    if (isError) {
+        Serial.println("error state restored from before power-off");
     }
 
     timer6.pause();
@@ -1155,15 +1639,25 @@ void bufferInit() {
     } else {
         Serial.println("mcp disabled");
     }
+
+    // Started last: boot has long deliberate delays, and the driver is
+    // disabled throughout it anyway
+    if (IWatchdog.isReset(true)) {
+        Serial.println("restarted by watchdog");
+    }
+    IWatchdog.begin(watchdogTimeoutUs);
 }
 
 void bufferLoop() {
+    IWatchdog.reload();
     readSensorState();
 
     if (debugEnabled) {
         bufferDebug();
     } else {
         motorControl();
+        _syncErrorLatch();
+        _refreshDriverWhileIdle();
         _updatePanelIndicators();
         _handleSerial();
     }
@@ -1174,21 +1668,19 @@ void timerItCallback() {
         return;
     }
 
-    ++frontTime;
+    frontTime = frontTime + 1;
 
-    if (frontTime <= timeoutMs) {
+    // This only restarts a long feed (stall recovery); the feed budget decides when to give up
+    const uint32_t kickMs =
+        (feedPrimed && primedFeedKickMs < timeoutMs) ? primedFeedKickMs : timeoutMs;
+
+    if (frontTime <= kickMs) {
         return;
     }
 
     isFront = false;
     frontTime = 0;
-
-    if (autoRetryCount < maxAutoRetries) {
-        ++autoRetryCount;
-        autoRetryRequested = true;
-    } else {
-        isError = true;
-    }
+    autoRetryRequested = true;
 }
 
 void bufferDebug() {

@@ -62,9 +62,45 @@ constexpr uint16_t currentAutoMa = 600;
 constexpr uint16_t currentButtonMa = 900;
 
 // Timeout / retry settings
+// A continuous automatic feed is stopped and restarted every timeoutMs (stall recovery).
+// maxAutoRetries sets how many restarts fit in the loading budget below.
 constexpr uint32_t defaultTimeoutMs = 10000;
 constexpr uint8_t maxAutoRetries = 6;
 constexpr uint32_t autoRetryPauseMs = 400;
+
+// Runaway feed guard (e.g. bowden tube popped off, so the buffer never fills).
+// Net automatic forward feed time is budgeted; stopping only refunds it slowly,
+// so a slider that flickers out of the feed position cannot reset it.
+// Loading budget (buffer not filled yet) = timeoutMs * (maxAutoRetries + 1).
+// Once the buffer has filled, refills are short, so the primed budget applies.
+constexpr uint32_t primedFeedBudgetMs = 10000;
+constexpr uint32_t primedFeedKickMs = 2500;   // restart interval while primed
+constexpr uint32_t feedPrimeDwellMs = 1000;   // time out of the feed position that counts as filled
+constexpr int32_t feedIdleRefundRate = 2;     // budget ms refunded per ms spent stopped
+
+// Panel latched motion stops by itself after this long without a new press
+constexpr uint32_t panelLatchMaxMs = 120000;
+
+// A held local button stops after this long and must be released to work again
+constexpr uint32_t localButtonMaxMs = 120000;
+
+// Input filtering: a new state must hold this long before it is acted on
+constexpr uint32_t inputDebounceMs = 50;   // runout switch and local buttons
+constexpr uint32_t panelDebounceMs = 30;   // panel buttons
+
+// Panel housekeeping
+constexpr uint32_t panelSetupRefreshMs = 2000;  // re-send the panel setup, or look for a missing panel
+constexpr uint8_t panelMaxReadFailures = 10;    // failed reads in a row before the panel counts as lost
+
+// Driver settings are re-sent this often while the motor is stopped
+constexpr uint32_t driverRefreshIntervalMs = 10000;
+
+// Hardware watchdog: resets the MCU if the main loop stops running
+constexpr uint32_t watchdogTimeoutUs = 8000000;
+
+// Accepted range for the stored feed timeout
+constexpr uint32_t minTimeoutMs = 1000;
+constexpr uint32_t maxTimeoutMs = 120000;
 
 // Status LED heartbeat
 constexpr uint32_t statusLedPeriodMs = 3000;
@@ -108,9 +144,9 @@ void timerItCallback();
 void bufferDebug();
 
 extern bool isError;
-extern uint32_t frontTime;
+extern volatile uint32_t frontTime;
 extern uint32_t timeoutMs;
-extern bool isFront;
+extern volatile bool isFront;
 extern TMC2209Stepper driver;
 
 #endif
