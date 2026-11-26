@@ -37,6 +37,9 @@ static FeedAccounting feedAccounting = FeedAccounting::hold;
 static uint32_t feedAccountLastMs = 0;
 static int32_t feedNetMs = 0;
 static uint32_t feedDwellMs = 0;
+static uint32_t feedBurstMs = 0;
+static uint32_t feedBurstPeakMs = 0;
+static uint32_t feedPauseMinMs = UINT32_MAX;
 static bool feedSeenSinceReset = false;
 static volatile bool feedPrimed = false;
 
@@ -144,7 +147,6 @@ static void _stopLocalManualMotion();
 static bool _runLocalManualMotion();
 static bool _runPanelManualMotion();
 static void _applyAutomaticMotorControl();
-static int32_t _getLoadFeedBudgetMs();
 static int32_t _getFeedBudgetMs();
 static void _resetFeedGuard();
 static void _accountFeedTime();
@@ -1223,30 +1225,14 @@ static void _applyAutomaticMotorControl() {
 
 // ===== Runaway feed guard =====
 
-static int32_t _getLoadFeedBudgetMs() {
-    constexpr uint32_t attempts = static_cast<uint32_t>(maxAutoRetries) + 1U;
-    constexpr uint32_t budgetCapMs = 0x3FFFFFFFUL;
-
-    if (timeoutMs > budgetCapMs / attempts) {
-        return static_cast<int32_t>(budgetCapMs);
-    }
-
-    return static_cast<int32_t>(timeoutMs * attempts);
-}
-
 static int32_t _getFeedBudgetMs() {
-    const int32_t loadBudgetMs = _getLoadFeedBudgetMs();
-
-    if (feedPrimed && static_cast<int32_t>(primedFeedBudgetMs) < loadBudgetMs) {
-        return static_cast<int32_t>(primedFeedBudgetMs);
-    }
-
-    return loadBudgetMs;
+    return static_cast<int32_t>(feedPrimed ? primedFeedBudgetMs : loadFeedBudgetMs);
 }
 
 static void _resetFeedGuard() {
     feedNetMs = 0;
     feedDwellMs = 0;
+    feedBurstMs = 0;
     feedSeenSinceReset = false;
     feedPrimed = false;
 }
@@ -1271,6 +1257,18 @@ static void _accountFeedTime() {
         }
 
         case FeedAccounting::feeding: {
+            if (feedPrimed) {
+                // Figures for the rt command: how hard normal printing works the feeder
+                if (feedDwellMs > 0 && feedDwellMs < feedPauseMinMs) {
+                    feedPauseMinMs = feedDwellMs;
+                }
+
+                feedBurstMs += elapsedMs;
+                if (feedBurstMs > feedBurstPeakMs) {
+                    feedBurstPeakMs = feedBurstMs;
+                }
+            }
+
             feedNetMs += elapsed;
             feedDwellMs = 0;
             feedSeenSinceReset = true;
@@ -1283,7 +1281,7 @@ static void _accountFeedTime() {
 
         case FeedAccounting::retracting: {
             // Filament pulled back is credit for feeding it forward again
-            const int32_t creditFloorMs = -_getLoadFeedBudgetMs();
+            const int32_t creditFloorMs = -static_cast<int32_t>(loadFeedBudgetMs);
 
             feedNetMs -= elapsed;
             if (feedNetMs < creditFloorMs) {
@@ -1306,16 +1304,20 @@ static void _accountFeedTime() {
         }
     }
 
-    if (feedDwellMs < feedPrimeDwellMs) {
+    feedBurstMs = 0;
+
+    if (feedDwellMs < elapsedCapMs) {
         feedDwellMs += elapsedMs;
     }
 
+    if (feedDwellMs >= feedFillDwellMs && feedNetMs > 0) {
+        // Out of the feed position too long to be a flicker: the buffer really
+        // filled, so everything fed so far went where it should
+        feedNetMs = 0;
+    }
+
     if (!feedPrimed && feedSeenSinceReset && feedDwellMs >= feedPrimeDwellMs) {
-        // The buffer filled, so everything fed so far went where it should
         feedPrimed = true;
-        if (feedNetMs > 0) {
-            feedNetMs = 0;
-        }
     }
 }
 
@@ -1490,6 +1492,19 @@ static void _runSerialCommand(const String &command) {
         Serial.println(feedPrimed ? " (primed)" : " (loading)");
         Serial.print("error=");
         Serial.println(isError);
+
+        // Since the last rt, after the first fill: the longest the feeder ran
+        // without a pause, and the shortest pause the printer left it
+        Serial.print("longest feed ms=");
+        Serial.print(feedBurstPeakMs);
+        Serial.print(" shortest pause ms=");
+        if (feedPauseMinMs == UINT32_MAX) {
+            Serial.println("none");
+        } else {
+            Serial.println(feedPauseMinMs);
+        }
+        feedBurstPeakMs = 0;
+        feedPauseMinMs = UINT32_MAX;
         return;
     }
 
